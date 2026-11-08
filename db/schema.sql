@@ -1,8 +1,8 @@
 -- Applied once by the postgres image on an empty data volume
 -- (/docker-entrypoint-initdb.d). After changing it: `make db-reset`.
 
--- Every accepted event. `id` is the replay cursor used by snapshots:
--- batches are inserted one at a time, so ids follow commit order.
+-- Every accepted event: the source of truth all read endpoints query.
+-- Batches are inserted one at a time, so ids follow commit order.
 CREATE TABLE events (
   id          BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   device_id   TEXT        NOT NULL,
@@ -21,8 +21,16 @@ CREATE TABLE events (
   rssi        INTEGER,                       -- net_status
 
   -- Event identity: a replayed copy of the same event is a duplicate.
-  UNIQUE (device_id, seq, ts)
+  -- Column order (device_id, ts, ...) lets the same index serve
+  -- "events of device X in a ts range" (device health).
+  UNIQUE (device_id, ts, seq)
 );
+
+-- Room occupancy: presence events of a room by ts (~5% of rows, so partial).
+-- INCLUDE makes it covering (index-only scan): a room's points are spread over
+-- many heap pages, so heap fetches made the 1h window ~6x slower under load.
+CREATE INDEX events_presence_room_ts_idx ON events (room_id, ts) INCLUDE (in_room, id)
+  WHERE type = 'presence';
 
 -- One row per deduplicated fall (incident). `id` follows commit order and is
 -- the SSE event id, so Last-Event-ID catch-up also returns late replayed falls.
@@ -36,3 +44,5 @@ CREATE TABLE alarms (
   received_at TIMESTAMPTZ NOT NULL           -- server time the first copy was ingested
 );
 CREATE INDEX alarms_ts_idx ON alarms (ts);
+-- Fall dedup: existing incidents of a device near a new fall_warn's ts.
+CREATE INDEX alarms_device_ts_idx ON alarms (device_id, ts);

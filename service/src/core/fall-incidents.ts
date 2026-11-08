@@ -8,12 +8,9 @@ import type { IngestEvent } from './event.js';
  */
 export const FALL_DEDUP_WINDOW_MS = 5_000;
 
-/** Incidents and alarms are kept for the 1h acceptance window. */
-export const ALARM_HISTORY_MS = 60 * 60_000;
-
-/** One deduplicated fall. The same object is shared by dedup state and the feed. */
+/** One deduplicated fall: a row of the alarms table. */
 export interface Alarm {
-  /** alarms.id once persisted (0 before): commit order, used as the SSE event id. */
+  /** alarms.id (0 until inserted): commit order, used as the SSE event id. */
   id: number;
   /** `${device_id}:${first ts}`, unique in the alarms table. */
   eventId: string;
@@ -27,70 +24,69 @@ export interface Alarm {
   receivedAtMs: number;
 }
 
-/** What a fall_warn changed: a new alarm, or a higher confidence on an existing one. */
-export type FallChange =
-  { kind: 'new'; alarm: Alarm } | { kind: 'raised'; alarm: Alarm };
+export type FallEvent = Extract<IngestEvent, { type: 'fall_warn' }>;
+
+export interface AlarmPlan {
+  /** Rows to upsert: new alarms and existing ones whose confidence went up. */
+  upserts: Alarm[];
+  /** The new alarms among them (to push to subscribers once committed). */
+  created: Alarm[];
+}
 
 export function alarmEventId(deviceId: string, tsMs: number): string {
   return `${deviceId}:${new Date(tsMs).toISOString()}`;
 }
 
 /**
- * Jitter dedup of fall warnings, per device.
+ * Jitter dedup for one batch of newly inserted fall_warns.
  *
- * Each device keeps its incidents of the last hour sorted by ts, not only the
- * newest one: a late replayed fall (offline buffer) must not replace the
- * current incident, or the next jitter copy of the live fall would alarm again.
- * Only committed, non-duplicate events arrive here, so an identical replayed
- * event never reaches this code.
+ * `existing` are the alarms already in Postgres near these falls (same
+ * devices, within the window); the caller holds a per-device lock, so no other
+ * transaction can add one meanwhile. Falls are applied in order: each joins the
+ * incident of its device whose first ts is nearest within 5s (raising the
+ * confidence if higher), or starts a new incident. Matching against every
+ * nearby incident, not only the newest, keeps a late replayed fall from
+ * breaking dedup of a live one.
  */
-export class FallIncidents {
-  private readonly byDevice = new Map<string, Alarm[]>();
+export function planAlarms(existing: Alarm[], falls: FallEvent[]): AlarmPlan {
+  const byDevice = new Map<string, Alarm[]>();
+  for (const a of existing) listFor(byDevice, a.deviceId).push(a);
 
-  apply(event: IngestEvent): FallChange | undefined {
-    if (event.type !== 'fall_warn') return undefined;
-
-    let incidents = this.byDevice.get(event.deviceId);
-    if (!incidents) {
-      incidents = [];
-      this.byDevice.set(event.deviceId, incidents);
-    }
-    // Older events are rejected at ingest, so these incidents can't match again.
-    prune(
-      incidents,
-      event.receivedAtMs - ALARM_HISTORY_MS - FALL_DEDUP_WINDOW_MS,
-    );
-
-    const match = closestWithinWindow(incidents, event.tsMs);
+  const upserts = new Map<string, Alarm>(); // by eventId: one row per statement
+  const created: Alarm[] = [];
+  for (const fall of falls) {
+    const incidents = listFor(byDevice, fall.deviceId);
+    const match = closestWithinWindow(incidents, fall.tsMs);
     if (match) {
-      if (event.confidence <= match.confidence) return undefined;
-      match.confidence = event.confidence;
-      return { kind: 'raised', alarm: match };
+      if (fall.confidence > match.confidence) {
+        match.confidence = fall.confidence;
+        upserts.set(match.eventId, match);
+      }
+      continue;
     }
-
     const alarm: Alarm = {
       id: 0,
-      eventId: alarmEventId(event.deviceId, event.tsMs),
-      deviceId: event.deviceId,
-      roomId: event.roomId,
-      tsMs: event.tsMs,
-      confidence: event.confidence,
-      receivedAtMs: event.receivedAtMs,
+      eventId: alarmEventId(fall.deviceId, fall.tsMs),
+      deviceId: fall.deviceId,
+      roomId: fall.roomId,
+      tsMs: fall.tsMs,
+      confidence: fall.confidence,
+      receivedAtMs: fall.receivedAtMs,
     };
-    insertByTs(incidents, alarm);
-    return { kind: 'new', alarm };
+    incidents.push(alarm);
+    created.push(alarm);
+    upserts.set(alarm.eventId, alarm);
   }
+  return { upserts: [...upserts.values()], created };
+}
 
-  /** Restores dedup state from persisted alarms (startup), so it survives a restart. */
-  seed(alarm: Alarm): void {
-    let incidents = this.byDevice.get(alarm.deviceId);
-    if (!incidents) {
-      incidents = [];
-      this.byDevice.set(alarm.deviceId, incidents);
-    }
-    if (!incidents.some((a) => a.eventId === alarm.eventId))
-      insertByTs(incidents, alarm);
+function listFor(map: Map<string, Alarm[]>, deviceId: string): Alarm[] {
+  let list = map.get(deviceId);
+  if (!list) {
+    list = [];
+    map.set(deviceId, list);
   }
+  return list;
 }
 
 /** The incident whose first ts is nearest to `tsMs`, if within the window. */
@@ -109,16 +105,4 @@ function closestWithinWindow(
     }
   }
   return best;
-}
-
-function insertByTs(alarms: Alarm[], alarm: Alarm): void {
-  let i = alarms.length;
-  while (i > 0 && alarms[i - 1].tsMs > alarm.tsMs) i--; // late ones are rare: scan from the end
-  alarms.splice(i, 0, alarm);
-}
-
-function prune(alarms: Alarm[], cutoffMs: number): void {
-  let drop = 0;
-  while (drop < alarms.length && alarms[drop].tsMs < cutoffMs) drop++;
-  if (drop > 0) alarms.splice(0, drop);
 }

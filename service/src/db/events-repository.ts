@@ -12,7 +12,7 @@ const INSERT_EVENTS = `
     $1::text[], $2::text[], $3::text[], $4::timestamptz[], $5::bigint[],
     $6::boolean[], $7::float8[], $8::text[], $9::float8[], $10::integer[], $11::timestamptz[]
   )
-  ON CONFLICT (device_id, seq, ts) DO NOTHING
+  ON CONFLICT (device_id, ts, seq) DO NOTHING
   RETURNING id, device_id, seq, ts`;
 
 export async function insertEvents(

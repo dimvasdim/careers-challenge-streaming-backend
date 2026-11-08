@@ -1,16 +1,7 @@
 import type pg from 'pg';
-import type { Alarm } from '../core/fall-incidents.js';
+import { type Alarm, FALL_DEDUP_WINDOW_MS } from '../core/fall-incidents.js';
 
-// One statement per batch. A new incident is inserted; an existing one keeps
-// the higher confidence. RETURNING gives every row's id (also on conflict),
-// which keeps retries idempotent.
-const UPSERT_ALARMS = `
-  INSERT INTO alarms (event_id, device_id, room_id, ts, confidence, received_at)
-  SELECT * FROM unnest(
-    $1::text[], $2::text[], $3::text[], $4::timestamptz[], $5::float8[], $6::timestamptz[]
-  )
-  ON CONFLICT (event_id) DO UPDATE SET confidence = GREATEST(alarms.confidence, EXCLUDED.confidence)
-  RETURNING id, event_id`;
+type Db = pg.Pool | pg.PoolClient;
 
 const COLUMNS = 'id, event_id, device_id, room_id, ts, confidence, received_at';
 
@@ -36,12 +27,60 @@ function toAlarm(r: AlarmRow): Alarm {
   };
 }
 
-export async function upsertAlarms(
-  db: pg.Pool | pg.PoolClient,
-  alarms: Alarm[],
-): Promise<Array<{ id: number; eventId: string }>> {
-  if (alarms.length === 0) return [];
-  const result = await db.query<{ id: string; event_id: string }>(
+/**
+ * Per-device advisory locks, held until the transaction ends. Two transactions
+ * handling falls of the same device then run "look for a nearby alarm, then
+ * insert" one after the other, so two copies of one fall can't both create an
+ * alarm. Different devices never wait for each other. Locks are taken in key
+ * order, so two transactions locking several devices can't deadlock.
+ * (A hash collision only makes two devices wait for each other occasionally.)
+ */
+export async function lockDevices(
+  db: pg.PoolClient,
+  deviceIds: string[],
+): Promise<void> {
+  await db.query(
+    `SELECT pg_advisory_xact_lock(key)
+     FROM (SELECT DISTINCT hashtext(device_id) AS key
+           FROM unnest($1::text[]) AS device_id
+           ORDER BY key OFFSET 0) AS keys`,
+    [deviceIds],
+  );
+}
+
+/** Alarms of these devices with ts within the dedup window of [fromMs, toMs]. */
+export async function loadNearbyAlarms(
+  db: Db,
+  deviceIds: string[],
+  fromMs: number,
+  toMs: number,
+): Promise<Alarm[]> {
+  const { rows } = await db.query<AlarmRow>(
+    `SELECT ${COLUMNS} FROM alarms
+     WHERE device_id = ANY($1) AND ts BETWEEN $2 AND $3`,
+    [
+      deviceIds,
+      new Date(fromMs - FALL_DEDUP_WINDOW_MS).toISOString(),
+      new Date(toMs + FALL_DEDUP_WINDOW_MS).toISOString(),
+    ],
+  );
+  return rows.map(toAlarm);
+}
+
+// New incidents are inserted; existing ones keep the higher confidence.
+// RETURNING gives each row's id (also on conflict).
+const UPSERT_ALARMS = `
+  INSERT INTO alarms (event_id, device_id, room_id, ts, confidence, received_at)
+  SELECT * FROM unnest(
+    $1::text[], $2::text[], $3::text[], $4::timestamptz[], $5::float8[], $6::timestamptz[]
+  )
+  ON CONFLICT (event_id) DO UPDATE SET confidence = GREATEST(alarms.confidence, EXCLUDED.confidence)
+  RETURNING id, event_id`;
+
+/** Upserts the alarms (one statement) and sets each one's `id`. */
+export async function upsertAlarms(db: Db, alarms: Alarm[]): Promise<void> {
+  if (alarms.length === 0) return;
+  const { rows } = await db.query<{ id: string; event_id: string }>(
     UPSERT_ALARMS,
     [
       alarms.map((a) => a.eventId),
@@ -52,40 +91,30 @@ export async function upsertAlarms(
       alarms.map((a) => new Date(a.receivedAtMs).toISOString()),
     ],
   );
-  return result.rows.map((r) => ({ id: Number(r.id), eventId: r.event_id }));
+  const idByEventId = new Map(rows.map((r) => [r.event_id, Number(r.id)]));
+  for (const a of alarms) a.id = idByEventId.get(a.eventId) ?? a.id;
 }
 
-/**
- * Startup: alarms with ts >= fromMs (id order), and the highest id of the
- * older ones, which memory will not hold.
- */
-export async function loadRecentAlarms(
-  db: pg.Pool,
-  fromMs: number,
-): Promise<{ alarms: Alarm[]; maxOlderId: number }> {
-  const from = new Date(fromMs).toISOString();
-  const recent = await db.query<AlarmRow>(
-    `SELECT ${COLUMNS} FROM alarms WHERE ts >= $1 ORDER BY id`,
-    [from],
+/** GET /alarms: alarms with ts >= sinceMs, sorted by ts. */
+export async function listAlarmsSince(
+  db: Db,
+  sinceMs: number,
+): Promise<Alarm[]> {
+  const { rows } = await db.query<AlarmRow>(
+    `SELECT ${COLUMNS} FROM alarms WHERE ts >= $1 ORDER BY ts, id`,
+    [new Date(sinceMs).toISOString()],
   );
-  const older = await db.query<{ max: string | null }>(
-    'SELECT max(id) AS max FROM alarms WHERE ts < $1',
-    [from],
-  );
-  return {
-    alarms: recent.rows.map(toAlarm),
-    maxOlderId: Number(older.rows[0].max ?? 0),
-  };
+  return rows.map(toAlarm);
 }
 
-/** SSE catch-up beyond memory: alarms with id > afterId, in id order. */
+/** SSE catch-up: alarms with id > afterId, in id order. */
 export async function loadAlarmsAfter(
-  db: pg.Pool,
+  db: Db,
   afterId: number,
 ): Promise<Alarm[]> {
-  const result = await db.query<AlarmRow>(
+  const { rows } = await db.query<AlarmRow>(
     `SELECT ${COLUMNS} FROM alarms WHERE id > $1 ORDER BY id`,
     [afterId],
   );
-  return result.rows.map(toAlarm);
+  return rows.map(toAlarm);
 }

@@ -1,4 +1,4 @@
-import { BatchWriter, type BatchWriterOptions, type InsertedRow } from './batch-writer.js';
+import { BatchWriter, type BatchResult, type BatchWriterOptions, type InsertedRow } from './batch-writer.js';
 import { eventKey, type IngestEvent } from './event.js';
 
 const T0 = Date.parse('2026-05-23T18:00:00.000Z');
@@ -35,7 +35,7 @@ function fakeDb() {
   let gate: Promise<void> | undefined;
   let openGate: (() => void) | undefined;
 
-  const insertBatch = async (events: IngestEvent[]): Promise<InsertedRow[]> => {
+  const insertBatch = async (events: IngestEvent[]): Promise<BatchResult> => {
     inFlight++;
     maxInFlight = Math.max(maxInFlight, inFlight);
     try {
@@ -52,7 +52,7 @@ function fakeDb() {
         keys.add(k);
         rows.push({ id: nextId++, deviceId: e.deviceId, seq: e.seq, tsMs: e.tsMs });
       }
-      return rows;
+      return { inserted: rows, alarms: [] };
     } finally {
       inFlight--;
     }
@@ -200,7 +200,7 @@ describe('BatchWriter', () => {
     await Promise.all([w.submit(hb(1)), w.submit(hb(2))].map((p) => p.then((r) => order.push(r))));
 
     expect(onCommitted).toHaveBeenCalledTimes(2);
-    expect(onCommitted.mock.calls[1]).toEqual([[{ id: 2, event: hb(2) }]]);
+    expect(onCommitted.mock.calls[1]).toEqual([[{ id: 2, event: hb(2) }], []]);
     expect(order).toEqual(['committed', 'committed', 'duplicate', 'inserted']);
   });
 

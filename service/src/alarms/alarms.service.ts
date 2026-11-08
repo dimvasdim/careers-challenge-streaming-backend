@@ -1,64 +1,30 @@
-import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import type pg from 'pg';
-import { AlarmWriter } from '../core/alarm-writer.js';
-import {
-  ALARM_HISTORY_MS,
-  FALL_DEDUP_WINDOW_MS,
-  type FallChange,
-} from '../core/fall-incidents.js';
-import { ReadModels } from '../core/read-models.js';
+import { AlarmHub } from '../core/alarm-hub.js';
+import type { Alarm } from '../core/fall-incidents.js';
 import { PG_POOL } from '../db/database.module.js';
-import {
-  loadAlarmsAfter,
-  loadRecentAlarms,
-  upsertAlarms,
-} from '../db/alarms-repository.js';
+import { listAlarmsSince, loadAlarmsAfter } from '../db/alarms-repository.js';
 
-/** Persists fall incidents, then publishes them to the in-memory feed (and SSE). */
+/**
+ * Alarms live in Postgres (written with their events, see db/batch-commit.ts).
+ * This service reads them and fans newly committed ones out to SSE subscribers.
+ */
 @Injectable()
-export class AlarmsService implements OnModuleInit {
-  private readonly logger = new Logger('Alarms');
-  private readonly writer: AlarmWriter;
+export class AlarmsService {
+  readonly hub = new AlarmHub();
 
-  constructor(
-    @Inject(PG_POOL) private readonly pool: pg.Pool,
-    private readonly readModels: ReadModels,
-  ) {
-    this.writer = new AlarmWriter({
-      upsertAlarms: (alarms) => upsertAlarms(pool, alarms),
-      // Only after the commit: subscribers never see an alarm Postgres doesn't have.
-      onPersisted: (alarms) => readModels.alarmFeed.publish(alarms, Date.now()),
-      onError: (err, { attempt, batchSize }) => {
-        const message = err instanceof Error ? err.message : String(err);
-        this.logger.warn(
-          `alarm write failed (attempt ${attempt}, ${batchSize} alarms): ${message}`,
-        );
-      },
-    });
+  constructor(@Inject(PG_POOL) private readonly pool: pg.Pool) {}
+
+  /** Called by ingest after each commit, before the requests get their 2xx. */
+  publish(alarms: Alarm[]): void {
+    this.hub.publish(alarms);
   }
 
-  // Runs before the HTTP server listens: dedup state and the feed survive a restart.
-  async onModuleInit(): Promise<void> {
-    const started = Date.now();
-    const fromMs = started - ALARM_HISTORY_MS - FALL_DEDUP_WINDOW_MS;
-    const { alarms, maxOlderId } = await loadRecentAlarms(this.pool, fromMs);
-    for (const alarm of alarms) this.readModels.fallIncidents.seed(alarm);
-    this.readModels.alarmFeed.load(alarms, maxOlderId);
-    this.logger.log(
-      `loaded ${alarms.length} recent alarms in ${Date.now() - started} ms`,
-    );
+  listSince(sinceMs: number): Promise<Alarm[]> {
+    return listAlarmsSince(this.pool, sinceMs);
   }
 
-  enqueue(changes: FallChange[]): void {
-    this.writer.enqueue(changes);
-  }
-
-  loadAfter(afterId: number) {
+  loadAfter(afterId: number): Promise<Alarm[]> {
     return loadAlarmsAfter(this.pool, afterId);
-  }
-
-  /** Called by IngestService on shutdown, after the event queue is drained. */
-  drain(): Promise<void> {
-    return this.writer.drain();
   }
 }

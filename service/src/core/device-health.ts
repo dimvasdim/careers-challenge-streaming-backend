@@ -1,5 +1,3 @@
-import type { IngestEvent } from './event.js';
-
 export const HEALTH_WINDOW_SEC = 300; // availability over the last 5 minutes
 // Clock offsets beyond ±5 min (10x the documented ±30s drift) are treated as a
 // device fault: such an event never sets the device's clock offset, and a
@@ -18,21 +16,23 @@ export interface DeviceHealth {
   availability_5m: number;
 }
 
-interface DeviceState {
-  /** ring[sec % 300] = the unix second of a heartbeat in that slot (0 = empty). */
-  ring: Uint32Array;
-  /** Newest heartbeat ts seen (ms), or undefined if no heartbeat yet. */
-  lastHeartbeatTs: number | undefined;
-  /** Oldest event second seen: availability over a shorter life is not penalised. */
-  firstSeenSec: number;
-  /** Device clock offset: server arrival time − device ts, from its newest sane event. */
-  offsetMs: number;
-  /** Device ts of the event the offset was taken from. */
-  offsetFromTs: number;
+/** What the database returns for one device (see db/read-queries.ts). */
+export interface HealthInput {
+  /** Oldest event ts of the device (any type). */
+  firstSeenMs: number;
+  /** Arrival − ts of the device's newest event with a sane clock; 0 if none. */
+  clockOffsetMs: number;
+  /** Newest heartbeat ts that is not far ahead of its arrival, or null. */
+  lastHeartbeatMs: number | null;
+  /**
+   * Heartbeat ts values around the device's last 5 minutes (a superset is fine:
+   * the exact window is applied here), excluding ones far ahead of arrival.
+   */
+  heartbeatsMs: number[];
 }
 
 /**
- * Per-device heartbeat health, computed on read.
+ * Per-device heartbeat health as of server time `nowMs`.
  *
  * Availability = seconds in the device's last 5 minutes that hold a heartbeat,
  * divided by min(300, seconds since the device was first seen). Each second
@@ -47,63 +47,24 @@ interface DeviceState {
  * ~2/3 of them, so a healthy simulated device scores ~0.66 — the fraction of
  * expected 1 Hz heartbeats actually received.
  */
-export class DeviceHealthStore {
-  private readonly devices = new Map<string, DeviceState>();
+export function computeHealth(input: HealthInput, nowMs: number): DeviceHealth {
+  const deviceNowSec = Math.floor((nowMs - input.clockOffsetMs) / 1000);
+  const windowStart = deviceNowSec - HEALTH_WINDOW_SEC; // exclusive
 
-  apply(event: IngestEvent): void {
-    const sec = Math.floor(event.tsMs / 1000);
-    const offset = event.receivedAtMs - event.tsMs;
-    const saneClock = Math.abs(offset) <= MAX_CLOCK_OFFSET_MS;
-
-    let d = this.devices.get(event.deviceId);
-    if (!d) {
-      d = {
-        ring: new Uint32Array(HEALTH_WINDOW_SEC),
-        lastHeartbeatTs: undefined,
-        firstSeenSec: sec,
-        offsetMs: saneClock ? offset : 0,
-        offsetFromTs: saneClock ? event.tsMs : -Infinity,
-      };
-      this.devices.set(event.deviceId, d);
-    }
-
-    if (sec < d.firstSeenSec) d.firstSeenSec = sec; // late replay of an earlier event
-    if (saneClock && event.tsMs > d.offsetFromTs) {
-      d.offsetMs = offset;
-      d.offsetFromTs = event.tsMs;
-    }
-
-    if (event.type !== 'heartbeat') return;
-    // A heartbeat far ahead of its own arrival time is a broken clock reading: it is
-    // persisted, but kept out of health so it can't take a ring slot or the "last" ts.
-    if (-offset > MAX_CLOCK_OFFSET_MS) return;
-    if (d.lastHeartbeatTs === undefined || event.tsMs > d.lastHeartbeatTs) {
-      d.lastHeartbeatTs = event.tsMs;
-    }
-    // A newer second overwrites an older one in the same slot; a late older one is ignored.
-    const slot = sec % HEALTH_WINDOW_SEC;
-    if (d.ring[slot] < sec) d.ring[slot] = sec;
+  const seconds = new Set<number>();
+  for (const ts of input.heartbeatsMs) {
+    const sec = Math.floor(ts / 1000);
+    if (sec > windowStart && sec <= deviceNowSec) seconds.add(sec);
   }
 
-  /** Health as of server time `nowMs`, or undefined for a device never seen. */
-  getHealth(deviceId: string, nowMs: number): DeviceHealth | undefined {
-    const d = this.devices.get(deviceId);
-    if (!d) return undefined;
+  const lifetime = deviceNowSec - Math.floor(input.firstSeenMs / 1000) + 1;
+  const expected = Math.min(HEALTH_WINDOW_SEC, Math.max(1, lifetime));
 
-    const deviceNowSec = Math.floor((nowMs - d.offsetMs) / 1000);
-    const windowStart = deviceNowSec - HEALTH_WINDOW_SEC; // exclusive
-    let seconds = 0;
-    for (const s of d.ring) {
-      if (s > windowStart && s <= deviceNowSec) seconds++;
-    }
-
-    const lifetime = deviceNowSec - d.firstSeenSec + 1;
-    const expected = Math.min(HEALTH_WINDOW_SEC, Math.max(1, lifetime));
-
-    return {
-      last_heartbeat_ts:
-        d.lastHeartbeatTs === undefined ? null : new Date(d.lastHeartbeatTs).toISOString(),
-      availability_5m: Math.min(1, seconds / expected),
-    };
-  }
+  return {
+    last_heartbeat_ts:
+      input.lastHeartbeatMs === null
+        ? null
+        : new Date(input.lastHeartbeatMs).toISOString(),
+    availability_5m: Math.min(1, seconds.size / expected),
+  };
 }

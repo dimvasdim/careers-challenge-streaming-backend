@@ -84,7 +84,9 @@ describe('GET /rooms/:id/occupancy', () => {
     expect(res.statusCode).toBe(400);
   });
 
-  it('returns 404 for an unknown room', async () => {
-    expect((await occupancy('room_nope', '1m')).statusCode).toBe(404);
+  it('reports a room without presence events as absent', async () => {
+    const res = await occupancy('room_nope', '1m');
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ in_room: false, occupied_pct: 0 });
   });
 });

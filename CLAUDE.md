@@ -12,7 +12,8 @@
 
 ## Stack
 - TypeScript, NestJS with the Fastify adapter (`@nestjs/platform-fastify`), single Node process.
-- PostgreSQL for durability (plain Postgres, no TimescaleDB).
+- PostgreSQL is the single source of truth (plain Postgres, no TimescaleDB): every read endpoint
+  queries it; nothing but open SSE connections lives in memory.
 - Database access: plain `pg` (node-postgres) with a Pool and hand-written SQL; schema in
   `db/schema.sql` mounted into `/docker-entrypoint-initdb.d/`. No ORM (no Prisma/TypeORM).
 - Docker Compose for Postgres + service; `make run` target in the existing Makefile.
@@ -27,10 +28,11 @@
 - `git status` and `git diff` are fine to run.
 
 ## Code structure
-- `src/core/` — plain TypeScript, no decorators, no Nest imports: aggregators, dedup, batching,
-  snapshot/recovery. All core functions are pure where possible and unit-tested.
-- Nest is a thin shell: modules (Ingest, Health, Occupancy, Alarms, Metrics), lifecycle hooks
-  (load snapshot on init, flush on shutdown), the read endpoints and SSE.
+- `src/core/` — plain TypeScript, no decorators, no Nest imports: validation, batching, the
+  health/occupancy math, fall dedup, SSE subscription merge. Pure where possible and unit-tested.
+- `src/db/` — hand-written SQL. Rule: SQL selects the rows, `core/` does the math.
+- Nest is a thin shell: modules (Ingest, Health, Occupancy, Alarms, Metrics), shutdown drain,
+  the read endpoints and SSE.
 - The ingest hot path must not go through guards/interceptors/pipes per event.
 - Ingest sits behind an interface so another transport (MQTT) can be added later.
 - The service lives in service/; challenge files (event_generator/, eval/, docs/) stay untouched.
@@ -45,74 +47,73 @@
   (one insert in flight at a time, no fixed flush interval). Reply 2xx to all requests in a batch
   after it commits. A 2xx means "persisted".
 - Backpressure is internal: priority lane for `fall_warn`, heartbeats may wait; expose queue depth.
-- Duplicates: identity key `(device_id, seq, ts)`. `seq` may have gaps — never wait for missing seqs.
-  Postgres is the only dedup: events table has `UNIQUE (device_id, seq, ts)`; the batch insert uses
-  `ON CONFLICT DO NOTHING RETURNING`, and rows not returned are duplicates. Only inserted rows
-  reach memory (`onCommitted`), so read models never apply a duplicate. No in-memory seen-key set.
+- Duplicates: identity key `(device_id, ts, seq)`. `seq` may have gaps — never wait for missing seqs.
+  Postgres is the only dedup: events table has `UNIQUE (device_id, ts, seq)`; the batch insert uses
+  `ON CONFLICT DO NOTHING RETURNING`, and rows not returned are duplicates. Only inserted
+  fall_warns reach the fall dedup. No in-memory seen-key set.
+- One transaction per batch (`db/batch-commit.ts`): insert events, then create/update the alarms of
+  the new fall_warns, then COMMIT. Events and alarms are never out of sync after a crash.
 
-## In-memory state rules
-- All read models live in memory in ONE Node process:
-  - devices: `Map<deviceId, { ring: Uint32Array(300), lastHeartbeatTs, firstSeenTs, lastSeq }>`
-    (`lastSeq` only for the seq-gap metric)
-  - rooms: `Map<roomId, Presence[]>` (sorted by ts, change points only)
-  - falls: `Map<deviceId, { firstTs, maxConfidence, eventId }>` (current incident)
-  - recentAlarms: `Alarm[]` (last ~1h, sorted by ts) for `/alarms?since=` and SSE catch-up
-- Compute on read. No cron, no per-second recompute, no precomputed aggregates, no cache layer.
-  Writes are O(1)/O(log n); reads scan small bounded arrays.
-- Memory is bounded by the 1h acceptance window: evict by ts (presence keeps one carry-in event;
-  recentAlarms is pruned after 1h).
-- Events are applied to memory only after their batch is committed to Postgres,
-  so memory never contains anything that would be lost on a crash.
-- Snapshots: every N seconds, serialise all maps + the id of the last events-table row included.
-  Single-threaded, so a synchronous snapshot is consistent.
-- Startup: load latest snapshot → replay events with id > snapshot id → rebuild recentAlarms
-  from the alarms table → start accepting traffic. Log and record recovery time.
+## State and recovery
+- Postgres is the only state. Compute on read: no cron, no precomputed aggregates, no cache layer,
+  no in-memory read models. Reads are indexed range queries (measured on 1h x 5000 devices, 18M
+  rows: health ~0.5 ms, occupancy 1h ~0.3 ms; `service/scripts/read-bench/`).
+- Indexes: `UNIQUE (device_id, ts, seq)` also serves device ranges; partial covering index
+  `(room_id, ts) INCLUDE (in_room, id) WHERE type = 'presence'`; `alarms (ts)`, `alarms (device_id, ts)`.
+- Restart: nothing to recover — a restarted process serves correct reads immediately. SSE clients
+  reconnect with `Last-Event-ID` and catch up from the alarms table.
+- Pool: one connection for the batch writer, the rest for reads (`DB_POOL_SIZE`, default 6).
 
 ## Device health
 `GET /devices/{device_id}/health` → `{ last_heartbeat_ts, availability_5m }`
-- 300-slot ring buffer per device; slot index = `tsSec % 300`; each slot stores the second it holds.
-- availability = slots with second in `(now-300, now]` ÷ `min(300, seconds since first seen)`.
-- Late heartbeats write their slot if still inside the window; duplicates write the same value.
-- New devices appear without redeploy (just a new Map entry).
+- One query (`loadHealthInput`) + pure `computeHealth`.
+- availability = distinct heartbeat seconds in `(deviceNow-300, deviceNow]` ÷
+  `min(300, seconds since first seen)`; deviceNow = server now − clock offset of the newest event
+  with a sane clock (|arrival − ts| ≤ 5 min). Heartbeats > 5 min ahead of arrival are ignored.
+- Late heartbeats count once they are inserted; duplicates count once (distinct seconds).
+- Unknown device → 404. New devices appear without redeploy.
 
 ## Room occupancy
 `GET /rooms/{room_id}/occupancy?window=1m|5m|1h` → `{ in_room, occupied_pct }`
-- Per room: presence change points sorted by `ts`. Presence is emitted on state change
-  (the stub may repeat states — handle it).
-- Insert with binary search; skip exact duplicates (same ts + same state). Do not merge
-  consecutive equal states (a late opposite event may land between them).
-- Evict events older than 1h EXCEPT the newest of them (carry-in state for the window start).
+- One query (`loadPresencePoints`): presence events of the room from the window start on, plus the
+  newest one before it (carry-in), ordered by ts then commit order; pure `computeOccupancy`.
+- All devices of a room share one timeline (~2 devices per room): latest presence event by ts wins.
+  Device ts used as-is; the window ends at server now (no per-device clock correction).
 - occupied_pct = sum of "present" intervals clipped to `[now-window, now]` ÷ window;
   the latest state extends to now. `in_room` = state of the latest event by ts.
-- Before the first known event, the room counts as absent (document in writeup).
-- Keyed by `room_id` — check whether a room can have several presence devices.
+- Before the first known event the room counts as absent; a room without presence → `{false, 0}`.
+- Late events fix up the history automatically (the query reads whatever is committed).
 
 ## Fall warnings and alarm feed
 `GET /alarms?since=<ts>` → `{ alarms: [{ event_id, room_id, ts, confidence }] }`
 - No confidence threshold: every fall counts (missing a fall is worse than a false alarm).
-- Jitter dedup per device: a `fall_warn` with `|ts - firstTs| <= 5s` joins that incident
+- Jitter dedup per device: a `fall_warn` with `|ts - firstTs| <= 5s` joins the nearest incident
   (update maxConfidence, do not emit again); otherwise it starts a new incident.
-  Window is measured from `firstTs`, not from the last event. Each device keeps its incidents
-  of the last hour (not just the current one), so a late replayed fall can't break dedup of
-  a live one. 5s = "a few seconds" of jitter (README's 1s is delivery latency, unrelated).
+  Window is measured from `firstTs`, not from the last event. Matched against every nearby alarm
+  in the table, so a late replayed fall can't break dedup of a live one.
+  5s = "a few seconds" of jitter (README's 1s is delivery latency, unrelated).
+- In the batch transaction: per-device `pg_advisory_xact_lock` (sorted, no deadlocks) → load
+  nearby alarms → pure `planAlarms` → one upsert. The lock makes "look, then insert" safe even
+  with concurrent transactions (tested in `test/batch-commit.e2e-spec.ts`).
 - Incident `ts` = first fall_warn's ts (original timestamp). Late earlier copies inside the window merge.
 - `event_id = ${device_id}:${firstTs}`, `alarms` table with UNIQUE(event_id).
-  Persist to Postgres BEFORE pushing to subscribers.
+  Committed BEFORE being pushed to subscribers (pushed after COMMIT, before the 2xx).
 - Live feed over SSE (Nest `@Sse()` controller route), ordered per room, within 1s of ingestion.
   SSE event id = `alarms.id` (commit order), so `Last-Event-ID` catch-up also gets late replayed
-  alarms. Catch-up from recentAlarms, falling back to Postgres for older ranges.
-- On startup, load the last ~1h of incidents so dedup survives a restart.
+  alarms. Catch-up always from Postgres (`id > last`); `AlarmHub` only fans out to open connections.
+  Keepalives are SSE comments (no id).
+- `GET /alarms?since=` is a plain query on `alarms (ts)`; `since` = epoch seconds or ISO date.
 
 ## Observability
 - `/metrics` (prom-client): events ingested per type, rejected (by reason), duplicates dropped,
   seq gaps, queue depth per priority, batch size/lag, alarm latency histogram (ingest → SSE, p95),
-  SSE subscribers, recovery time, replayed events, default Node metrics (event-loop lag).
-- `pino` JSON logs for startup, recovery, backpressure, rejected events. Never log every event.
+  SSE subscribers, read query latency, default Node metrics (event-loop lag).
+- `pino` JSON logs for startup, backpressure, rejected events. Never log every event.
 - Optional Prometheus + Grafana in a Compose profile — not required.
 
 ## Testing
-- Unit tests for core functions: late events, room quiet for hours (carry-in), duplicate replays,
-  fall jitter copies, incident window edges, restart replay from snapshot.
+- Unit tests for the pure core functions; SQL behaviour (late events, carry-in, clock skew,
+  concurrency) in e2e tests against the `teton_test` database.
 - Run `eval/check.py` (baseline, burst, offline, adversarial) after each milestone.
 - Load-test the 10x burst early; watch event-loop lag and alarm p95.
 
@@ -121,7 +122,7 @@
 2. Device health
 3. Room occupancy
 4. Fall dedup + alarms + SSE feed
-5. Snapshots + restart recovery
+5. Restart verification (hard kill + SSE reconnect; no snapshots needed)
 6. Metrics + logs
 7. Writeup
 

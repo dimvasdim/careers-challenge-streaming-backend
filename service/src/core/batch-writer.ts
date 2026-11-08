@@ -1,4 +1,5 @@
 import { eventKey, type IngestEvent } from './event.js';
+import type { Alarm } from './fall-incidents.js';
 
 /** A row the database reports as newly inserted (absent = duplicate). */
 export interface InsertedRow {
@@ -14,13 +15,39 @@ export interface CommittedEvent {
   event: IngestEvent;
 }
 
+/** What one committed batch produced. */
+export interface BatchResult {
+  /** Rows actually inserted (absent = duplicate). */
+  inserted: InsertedRow[];
+  /** Alarms created in the same transaction, sorted by id. */
+  alarms: Alarm[];
+}
+
+/**
+ * Matches inserted rows back to the batch: the events-table id of each event,
+ * or undefined for a duplicate (also an identical copy later in the batch).
+ */
+export function matchInserted(
+  events: IngestEvent[],
+  inserted: InsertedRow[],
+): Array<number | undefined> {
+  const idByKey = new Map<string, number>();
+  for (const row of inserted) idByKey.set(eventKey(row), row.id);
+  return events.map((e) => {
+    const key = eventKey(e);
+    const id = idByKey.get(key);
+    idByKey.delete(key);
+    return id;
+  });
+}
+
 export type SubmitOutcome = 'inserted' | 'duplicate';
 
 export interface BatchWriterOptions {
-  /** Inserts the batch in one statement; returns only the rows actually inserted. */
-  insertBatch: (events: IngestEvent[]) => Promise<InsertedRow[]>;
-  /** Called after each commit with the newly inserted events, in batch order. */
-  onCommitted?: (committed: CommittedEvent[]) => void;
+  /** Writes the batch in one transaction; reports the inserted rows and new alarms. */
+  insertBatch: (events: IngestEvent[]) => Promise<BatchResult>;
+  /** Called after each commit with the newly inserted events (batch order) and new alarms. */
+  onCommitted?: (committed: CommittedEvent[], alarms: Alarm[]) => void;
   /** Called when an insert fails (the batch is retried) or onCommitted throws. */
   onError?: (err: unknown, context: { attempt: number; batchSize: number }) => void;
   maxBatchSize?: number;
@@ -127,9 +154,9 @@ export class BatchWriter {
       if (batch.length === 0) return;
       this.inFlightCount = batch.length;
 
-      let inserted: InsertedRow[];
+      let result: BatchResult;
       try {
-        inserted = await this.opts.insertBatch(batch.map((p) => p.event));
+        result = await this.opts.insertBatch(batch.map((p) => p.event));
       } catch (err) {
         this.failedAttempts++;
         this.retryBatch = batch; // retry the same batch, keeping order
@@ -139,7 +166,7 @@ export class BatchWriter {
       }
       this.failedAttempts = 0;
       this.inFlightCount = 0;
-      this.settle(batch, inserted);
+      this.settle(batch, result);
     } finally {
       this.flushing = false;
       if (this.isIdle()) {
@@ -150,29 +177,28 @@ export class BatchWriter {
     }
   }
 
-  /** Matches inserted rows back to requests, applies them, then replies. */
-  private settle(batch: Pending[], inserted: InsertedRow[]): void {
-    const idByKey = new Map<string, number>();
-    for (const row of inserted) idByKey.set(eventKey(row), row.id);
-
+  /** Matches inserted rows back to requests, hands them on, then replies. */
+  private settle(batch: Pending[], result: BatchResult): void {
+    const ids = matchInserted(
+      batch.map((p) => p.event),
+      result.inserted,
+    );
     const outcomes: SubmitOutcome[] = [];
     const committed: CommittedEvent[] = [];
-    for (const p of batch) {
-      const key = eventKey(p.event);
-      const id = idByKey.get(key);
+    batch.forEach((p, i) => {
+      const id = ids[i];
       if (id === undefined) {
         outcomes.push('duplicate');
       } else {
-        idByKey.delete(key); // an identical copy later in the batch is a duplicate
         committed.push({ id, event: p.event });
         outcomes.push('inserted');
       }
-    }
+    });
 
-    // Apply to memory before replying, so a 2xx means the event is also readable.
+    // Before replying: new alarms are pushed to subscribers before the 2xx.
     if (committed.length > 0 && this.opts.onCommitted) {
       try {
-        this.opts.onCommitted(committed);
+        this.opts.onCommitted(committed, result.alarms);
       } catch (err) {
         this.opts.onError?.(err, { attempt: 0, batchSize: batch.length });
       }

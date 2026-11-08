@@ -10,9 +10,8 @@ import {
 } from '@nestjs/common';
 import { Observable } from 'rxjs';
 import { loadConfig } from '../config.js';
-import { type AlarmJson, parseSince, toAlarmJson } from '../core/alarm-feed.js';
+import { type AlarmJson, parseSince, toAlarmJson } from '../core/alarm-json.js';
 import { openSubscription } from '../core/alarm-subscription.js';
-import { ReadModels } from '../core/read-models.js';
 import { AlarmsService } from './alarms.service.js';
 
 @Controller('alarms')
@@ -20,14 +19,11 @@ export class AlarmsController {
   private readonly logger = new Logger('Alarms');
   private readonly keepaliveMs = loadConfig().sseKeepaliveMs;
 
-  constructor(
-    private readonly readModels: ReadModels,
-    private readonly alarms: AlarmsService,
-  ) {}
+  constructor(private readonly alarms: AlarmsService) {}
 
-  /** Deduplicated falls with ts >= since (last hour, from memory), sorted by ts. */
+  /** Deduplicated falls with ts >= since, sorted by ts. */
   @Get()
-  list(@Query('since') since: unknown): { alarms: AlarmJson[] } {
+  async list(@Query('since') since: unknown): Promise<{ alarms: AlarmJson[] }> {
     const sinceMs = parseSince(since);
     if (sinceMs === undefined) {
       throw new BadRequestException(
@@ -35,7 +31,7 @@ export class AlarmsController {
       );
     }
     return {
-      alarms: this.readModels.alarmFeed.since(sinceMs).map(toAlarmJson),
+      alarms: (await this.alarms.listSince(sinceMs)).map(toAlarmJson),
     };
   }
 
@@ -52,7 +48,7 @@ export class AlarmsController {
     const lastEventId = parseLastEventId(header ?? query);
     return new Observable<MessageEvent>((subscriber) => {
       const close = openSubscription({
-        feed: this.readModels.alarmFeed,
+        hub: this.alarms.hub,
         lastEventId,
         loadAfter: (afterId) => this.alarms.loadAfter(afterId),
         send: (alarm) =>

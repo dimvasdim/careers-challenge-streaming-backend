@@ -1,11 +1,11 @@
-import type { AlarmFeed } from './alarm-feed.js';
+import type { AlarmHub } from './alarm-hub.js';
 import type { Alarm } from './fall-incidents.js';
 
 export interface SubscriptionOptions {
-  feed: AlarmFeed;
+  hub: AlarmHub;
   /** Last alarm id the client saw (SSE Last-Event-ID), or undefined for live only. */
   lastEventId: number | undefined;
-  /** Postgres fallback when memory no longer holds everything after `afterId`. */
+  /** Catch-up from Postgres: alarms with id > afterId, in id order. */
   loadAfter: (afterId: number) => Promise<Alarm[]>;
   send: (alarm: Alarm) => void;
   onError: (err: unknown) => void;
@@ -13,14 +13,14 @@ export interface SubscriptionOptions {
 
 /**
  * One SSE subscriber: optional catch-up, then live alarms, with no gaps or
- * doubles. Live alarms are listened to BEFORE the catch-up starts and buffered
- * until it is sent; anything with an id already sent is skipped. Returns a
- * function that ends the subscription.
+ * doubles. The live listener is registered BEFORE the catch-up query runs and
+ * buffers until the catch-up is sent, so an alarm committed in between is
+ * either in the query result or in the buffer; anything with an id already
+ * sent is skipped. Returns a function that ends the subscription.
  */
 export function openSubscription(opts: SubscriptionOptions): () => void {
-  const { feed, lastEventId } = opts;
-  let lastSent = lastEventId ?? feed.lastId();
-  let live = lastEventId === undefined;
+  let lastSent = opts.lastEventId ?? 0;
+  let live = opts.lastEventId === undefined;
   let closed = false;
   const buffered: Alarm[] = [];
 
@@ -30,18 +30,14 @@ export function openSubscription(opts: SubscriptionOptions): () => void {
     opts.send(alarm);
   };
 
-  const unsubscribe = feed.subscribe((alarms) => {
+  const unsubscribe = opts.hub.subscribe((alarms) => {
     if (live) alarms.forEach(sendNew);
     else buffered.push(...alarms);
   });
 
   if (!live) {
-    const afterId = lastSent;
-    const fromMemory = feed.after(afterId);
-    const backlog = fromMemory
-      ? Promise.resolve(fromMemory)
-      : opts.loadAfter(afterId);
-    backlog
+    opts
+      .loadAfter(lastSent)
       .then((alarms) => {
         alarms.forEach(sendNew);
         buffered.splice(0).forEach(sendNew);

@@ -1,15 +1,24 @@
-import { Controller, Get, NotFoundException, Param } from '@nestjs/common';
-import type { DeviceHealth } from '../core/device-health.js';
-import { ReadModels } from '../core/read-models.js';
+import {
+  Controller,
+  Get,
+  Inject,
+  NotFoundException,
+  Param,
+} from '@nestjs/common';
+import type pg from 'pg';
+import { computeHealth, type DeviceHealth } from '../core/device-health.js';
+import { PG_POOL } from '../db/database.module.js';
+import { loadHealthInput } from '../db/read-queries.js';
 
 @Controller('devices')
 export class DeviceHealthController {
-  constructor(private readonly readModels: ReadModels) {}
+  constructor(@Inject(PG_POOL) private readonly pool: pg.Pool) {}
 
   @Get(':deviceId/health')
-  health(@Param('deviceId') deviceId: string): DeviceHealth {
-    const health = this.readModels.deviceHealth.getHealth(deviceId, Date.now());
-    if (!health) throw new NotFoundException(`unknown device ${deviceId}`);
-    return health;
+  async health(@Param('deviceId') deviceId: string): Promise<DeviceHealth> {
+    const now = Date.now();
+    const input = await loadHealthInput(this.pool, deviceId, now);
+    if (!input) throw new NotFoundException(`unknown device ${deviceId}`);
+    return computeHealth(input, now);
   }
 }
