@@ -1,4 +1,5 @@
-// Validated event shapes. `tsMs` is the device timestamp parsed once at ingest.
+// Validated event shapes. `tsMs` is the device timestamp parsed once at ingest;
+// `receivedAtMs` is server time at ingest (used to estimate each device's clock offset).
 
 export const EVENT_TYPES = [
   'heartbeat',
@@ -18,6 +19,7 @@ interface Envelope {
   roomId: string;
   seq: number;
   tsMs: number;
+  receivedAtMs: number;
 }
 
 export type IngestEvent = Envelope &

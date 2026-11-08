@@ -35,6 +35,7 @@ describe('validateEvent', () => {
           roomId: 'room_014',
           seq: 42,
           tsMs: NOW,
+          receivedAtMs: NOW,
           type: body.type,
         });
       }

@@ -3,7 +3,7 @@ import type { IngestEvent } from '../src/core/event.js';
 import { insertEvents } from '../src/db/events-repository.js';
 
 const T0 = Date.parse('2026-05-23T18:53:49.123Z');
-const envelope = { deviceId: 'dev_0001', roomId: 'room_000' };
+const envelope = { deviceId: 'dev_0001', roomId: 'room_000', receivedAtMs: T0 + 500 };
 
 const allTypes: IngestEvent[] = [
   { ...envelope, seq: 1, tsMs: T0, type: 'heartbeat' },
@@ -29,9 +29,10 @@ describe('insertEvents', () => {
     expect(inserted[0]).toEqual({ id: 1, deviceId: 'dev_0001', seq: 1, tsMs: T0 });
 
     const { rows } = await pool.query(
-      'SELECT type, ts, in_room, magnitude, state, confidence, rssi FROM events ORDER BY id',
+      'SELECT type, ts, received_at, in_room, magnitude, state, confidence, rssi FROM events ORDER BY id',
     );
     expect(rows.map((r) => (r.ts as Date).getTime())).toEqual(allTypes.map((e) => e.tsMs));
+    expect((rows[0].received_at as Date).getTime()).toBe(T0 + 500);
     expect(rows[1].in_room).toBe(true);
     expect(rows[2].magnitude).toBe(0.81);
     expect(rows[3].state).toBe('asleep');

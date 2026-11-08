@@ -9,6 +9,7 @@ const hb = (seq: number, deviceId = 'dev_0001'): IngestEvent => ({
   roomId: 'room_000',
   seq,
   tsMs: T0 + seq * 1000,
+  receivedAtMs: T0 + seq * 1000,
 });
 const fall = (seq: number): IngestEvent => ({
   type: 'fall_warn',
@@ -16,6 +17,7 @@ const fall = (seq: number): IngestEvent => ({
   roomId: 'room_000',
   seq,
   tsMs: T0 + seq * 1000,
+  receivedAtMs: T0 + seq * 1000,
   confidence: 0.9,
 });
 

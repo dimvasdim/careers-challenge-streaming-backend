@@ -54,7 +54,13 @@ export function validateEvent(body: unknown, nowMs: number): ValidationResult {
   if (tsMs > nowMs + ACCEPT_WINDOW_MS) return reject('ts_future');
   if (tsMs < nowMs - ACCEPT_WINDOW_MS) return reject('ts_too_old');
 
-  const envelope = { deviceId: b.device_id, roomId: b.room_id, seq: b.seq, tsMs };
+  const envelope = {
+    deviceId: b.device_id,
+    roomId: b.room_id,
+    seq: b.seq,
+    tsMs,
+    receivedAtMs: nowMs,
+  };
   const type = b.type as EventType;
 
   switch (type) {

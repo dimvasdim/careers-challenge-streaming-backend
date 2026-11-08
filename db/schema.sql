@@ -11,7 +11,7 @@ CREATE TABLE events (
                 ('heartbeat', 'presence', 'motion', 'sleep_state', 'fall_warn', 'net_status')),
   ts          TIMESTAMPTZ NOT NULL,          -- device clock, authoritative for ordering
   seq         BIGINT      NOT NULL,
-  received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  received_at TIMESTAMPTZ NOT NULL DEFAULT now(), -- server time at ingest (set by the service)
 
   -- Type-specific fields, NULL when not applicable to `type`.
   in_room     BOOLEAN,                       -- presence

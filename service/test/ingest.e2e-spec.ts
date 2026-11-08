@@ -1,9 +1,8 @@
-import { Test } from '@nestjs/testing';
-import { FastifyAdapter, type NestFastifyApplication } from '@nestjs/platform-fastify';
+import type { NestFastifyApplication } from '@nestjs/platform-fastify';
 import type { FastifyInstance } from 'fastify';
 import pg from 'pg';
-import { AppModule } from '../src/app.module.js';
 import { IngestService } from '../src/ingest/ingest.service.js';
+import { startApp } from './app.js';
 
 const event = (seq: number, type = 'heartbeat', extra: Record<string, unknown> = {}) => ({
   device_id: 'dev_0001',
@@ -13,17 +12,6 @@ const event = (seq: number, type = 'heartbeat', extra: Record<string, unknown> =
   seq,
   ...extra,
 });
-
-async function startApp(): Promise<{ app: NestFastifyApplication; fastify: FastifyInstance }> {
-  const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
-  const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter(), {
-    logger: false,
-  });
-  await app.init();
-  const fastify = app.getHttpAdapter().getInstance();
-  await fastify.ready();
-  return { app, fastify };
-}
 
 describe('POST /events', () => {
   let db: pg.Pool;

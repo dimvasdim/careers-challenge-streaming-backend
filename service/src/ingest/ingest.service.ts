@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger, type OnApplicationShutdown } from '@nestjs/
 import type pg from 'pg';
 import { loadConfig } from '../config.js';
 import { BatchWriter } from '../core/batch-writer.js';
+import { ReadModels } from '../core/read-models.js';
 import { validateEvent } from '../core/validate.js';
 import { PG_POOL } from '../db/database.module.js';
 import { insertEvents } from '../db/events-repository.js';
@@ -12,10 +13,12 @@ export class IngestService implements EventIngest, OnApplicationShutdown {
   private readonly logger = new Logger('Ingest');
   readonly writer: BatchWriter;
 
-  constructor(@Inject(PG_POOL) pool: pg.Pool) {
+  constructor(@Inject(PG_POOL) pool: pg.Pool, readModels: ReadModels) {
     const config = loadConfig();
     this.writer = new BatchWriter({
       insertBatch: (events) => insertEvents(pool, events),
+      // Committed, non-duplicate events only; applied before the requests get their 2xx.
+      onCommitted: (committed) => readModels.apply(committed),
       maxBatchSize: config.batchMaxSize,
       onError: (err, { attempt, batchSize }) => {
         const message = err instanceof Error ? err.message : String(err);
