@@ -14,3 +14,4 @@ build/
 .env.local
 data/snapshots/
 .claude
+*.tsbuildinfo

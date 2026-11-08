@@ -40,23 +40,27 @@
 - Validation: reject malformed/missing fields and `ts` > 1h in the future → 400 + metric.
   Accept `ts` up to 1h in the past. `ts` is authoritative for ordering, never arrival time.
 - Never return 429/503 for valid events: the generator does not retry, so a rejection = lost event.
-- Group commit: buffer events, insert into Postgres in batches every ~10–20 ms, then reply 2xx
-  to all requests in that batch. A 2xx means "persisted".
+- Group commit: flush when idle, batch while busy. If no insert is running, write the queue on the
+  next event-loop turn; while an insert is in flight, new events queue and form the next batch
+  (one insert in flight at a time, no fixed flush interval). Reply 2xx to all requests in a batch
+  after it commits. A 2xx means "persisted".
 - Backpressure is internal: priority lane for `fall_warn`, heartbeats may wait; expose queue depth.
 - Duplicates: identity key `(device_id, seq, ts)`. `seq` may have gaps — never wait for missing seqs.
-  Keep ~1h of seen keys per device in memory. Events table has `UNIQUE (device_id, seq, ts)`
-  with `ON CONFLICT DO NOTHING`.
+  Postgres is the only dedup: events table has `UNIQUE (device_id, seq, ts)`; the batch insert uses
+  `ON CONFLICT DO NOTHING RETURNING`, and rows not returned are duplicates. Only inserted rows
+  reach memory (`onCommitted`), so read models never apply a duplicate. No in-memory seen-key set.
 
 ## In-memory state rules
 - All read models live in memory in ONE Node process:
-  - devices: `Map<deviceId, { ring: Uint32Array(300), lastHeartbeatTs, firstSeenTs, seenKeys }>`
+  - devices: `Map<deviceId, { ring: Uint32Array(300), lastHeartbeatTs, firstSeenTs, lastSeq }>`
+    (`lastSeq` only for the seq-gap metric)
   - rooms: `Map<roomId, Presence[]>` (sorted by ts, change points only)
   - falls: `Map<deviceId, { firstTs, maxConfidence, eventId }>` (current incident)
   - recentAlarms: `Alarm[]` (last ~1h, sorted by ts) for `/alarms?since=` and SSE catch-up
 - Compute on read. No cron, no per-second recompute, no precomputed aggregates, no cache layer.
   Writes are O(1)/O(log n); reads scan small bounded arrays.
 - Memory is bounded by the 1h acceptance window: evict by ts (presence keeps one carry-in event;
-  seenKeys and recentAlarms are pruned after 1h).
+  recentAlarms is pruned after 1h).
 - Events are applied to memory only after their batch is committed to Postgres,
   so memory never contains anything that would be lost on a crash.
 - Snapshots: every N seconds, serialise all maps + the id of the last events-table row included.
