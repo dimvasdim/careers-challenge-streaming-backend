@@ -1,5 +1,11 @@
-import { Inject, Injectable, Logger, type OnApplicationShutdown } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  Logger,
+  type OnApplicationShutdown,
+} from '@nestjs/common';
 import type pg from 'pg';
+import { AlarmsService } from '../alarms/alarms.service.js';
 import { loadConfig } from '../config.js';
 import { BatchWriter } from '../core/batch-writer.js';
 import { ReadModels } from '../core/read-models.js';
@@ -13,16 +19,23 @@ export class IngestService implements EventIngest, OnApplicationShutdown {
   private readonly logger = new Logger('Ingest');
   readonly writer: BatchWriter;
 
-  constructor(@Inject(PG_POOL) pool: pg.Pool, readModels: ReadModels) {
+  constructor(
+    @Inject(PG_POOL) pool: pg.Pool,
+    readModels: ReadModels,
+    private readonly alarms: AlarmsService,
+  ) {
     const config = loadConfig();
     this.writer = new BatchWriter({
       insertBatch: (events) => insertEvents(pool, events),
       // Committed, non-duplicate events only; applied before the requests get their 2xx.
-      onCommitted: (committed) => readModels.apply(committed),
+      // New falls go on to be persisted as alarms, then pushed to subscribers.
+      onCommitted: (committed) => alarms.enqueue(readModels.apply(committed)),
       maxBatchSize: config.batchMaxSize,
       onError: (err, { attempt, batchSize }) => {
         const message = err instanceof Error ? err.message : String(err);
-        this.logger.warn(`batch write failed (attempt ${attempt}, ${batchSize} events): ${message}`);
+        this.logger.warn(
+          `batch write failed (attempt ${attempt}, ${batchSize} events): ${message}`,
+        );
       },
     });
   }
@@ -37,7 +50,10 @@ export class IngestService implements EventIngest, OnApplicationShutdown {
   // global DatabaseModule closes the pool.
   async onApplicationShutdown(): Promise<void> {
     const depth = this.writer.queueDepth();
-    this.logger.log(`draining ingest queue (${depth.priority + depth.normal + depth.inFlight} events)`);
+    this.logger.log(
+      `draining ingest queue (${depth.priority + depth.normal + depth.inFlight} events)`,
+    );
     await this.writer.drain();
+    await this.alarms.drain(); // alarms created by the last batches
   }
 }

@@ -1,5 +1,7 @@
+import { AlarmFeed } from './alarm-feed.js';
 import type { CommittedEvent } from './batch-writer.js';
 import { DeviceHealthStore } from './device-health.js';
+import { type FallChange, FallIncidents } from './fall-incidents.js';
 import { RoomOccupancyStore } from './room-occupancy.js';
 
 /**
@@ -9,11 +11,19 @@ import { RoomOccupancyStore } from './room-occupancy.js';
 export class ReadModels {
   readonly deviceHealth = new DeviceHealthStore();
   readonly roomOccupancy = new RoomOccupancyStore();
+  readonly fallIncidents = new FallIncidents();
+  /** Holds only alarms already persisted to the alarms table (see AlarmWriter). */
+  readonly alarmFeed = new AlarmFeed();
 
-  apply(committed: CommittedEvent[]): void {
+  /** Applies committed events; returns the fall changes still to be persisted. */
+  apply(committed: CommittedEvent[]): FallChange[] {
+    const fallChanges: FallChange[] = [];
     for (const { event } of committed) {
       this.deviceHealth.apply(event);
       this.roomOccupancy.apply(event);
+      const change = this.fallIncidents.apply(event);
+      if (change) fallChanges.push(change);
     }
+    return fallChanges;
   }
 }

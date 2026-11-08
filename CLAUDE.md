@@ -90,14 +90,17 @@
 ## Fall warnings and alarm feed
 `GET /alarms?since=<ts>` → `{ alarms: [{ event_id, room_id, ts, confidence }] }`
 - No confidence threshold: every fall counts (missing a fall is worse than a false alarm).
-- Jitter dedup per device: a `fall_warn` with `|ts - firstTs| <= 10s` joins the current incident
+- Jitter dedup per device: a `fall_warn` with `|ts - firstTs| <= 5s` joins that incident
   (update maxConfidence, do not emit again); otherwise it starts a new incident.
-  Window is measured from `firstTs`, not from the last event.
+  Window is measured from `firstTs`, not from the last event. Each device keeps its incidents
+  of the last hour (not just the current one), so a late replayed fall can't break dedup of
+  a live one. 5s = "a few seconds" of jitter (README's 1s is delivery latency, unrelated).
 - Incident `ts` = first fall_warn's ts (original timestamp). Late earlier copies inside the window merge.
 - `event_id = ${device_id}:${firstTs}`, `alarms` table with UNIQUE(event_id).
   Persist to Postgres BEFORE pushing to subscribers.
-- Live feed over SSE, ordered per room, within 1s of ingestion. Support `Last-Event-ID`
-  for catch-up from recentAlarms, falling back to Postgres for older ranges.
+- Live feed over SSE (Nest `@Sse()` controller route), ordered per room, within 1s of ingestion.
+  SSE event id = `alarms.id` (commit order), so `Last-Event-ID` catch-up also gets late replayed
+  alarms. Catch-up from recentAlarms, falling back to Postgres for older ranges.
 - On startup, load the last ~1h of incidents so dedup survives a restart.
 
 ## Observability

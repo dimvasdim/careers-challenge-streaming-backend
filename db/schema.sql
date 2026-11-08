@@ -23,3 +23,16 @@ CREATE TABLE events (
   -- Event identity: a replayed copy of the same event is a duplicate.
   UNIQUE (device_id, seq, ts)
 );
+
+-- One row per deduplicated fall (incident). `id` follows commit order and is
+-- the SSE event id, so Last-Event-ID catch-up also returns late replayed falls.
+CREATE TABLE alarms (
+  id          BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  event_id    TEXT        NOT NULL UNIQUE,   -- `${device_id}:${first ts, ISO 8601}`
+  device_id   TEXT        NOT NULL,
+  room_id     TEXT        NOT NULL,
+  ts          TIMESTAMPTZ NOT NULL,          -- first fall_warn's device ts
+  confidence  DOUBLE PRECISION NOT NULL,     -- max over the incident's copies
+  received_at TIMESTAMPTZ NOT NULL           -- server time the first copy was ingested
+);
+CREATE INDEX alarms_ts_idx ON alarms (ts);
