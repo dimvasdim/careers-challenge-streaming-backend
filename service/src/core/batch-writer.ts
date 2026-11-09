@@ -9,12 +9,6 @@ export interface InsertedRow {
   tsMs: number;
 }
 
-/** An event that is now durable, with its events-table id. */
-export interface CommittedEvent {
-  id: number;
-  event: IngestEvent;
-}
-
 /** What one committed batch produced. */
 export interface BatchResult {
   /** Rows actually inserted (absent = duplicate). */
@@ -46,9 +40,7 @@ export type SubmitOutcome = 'inserted' | 'duplicate';
 export interface BatchWriterOptions {
   /** Writes the batch in one transaction; reports the inserted rows and new alarms. */
   insertBatch: (events: IngestEvent[]) => Promise<BatchResult>;
-  /** Called after each commit with the newly inserted events (batch order) and new alarms. */
-  onCommitted?: (committed: CommittedEvent[], alarms: Alarm[]) => void;
-  /** Called when an insert fails (the batch is retried) or onCommitted throws. */
+  /** Called when an insert fails (the batch is retried). */
   onError?: (err: unknown, context: { attempt: number; batchSize: number }) => void;
   maxBatchSize?: number;
   retryBaseMs?: number;
@@ -177,32 +169,12 @@ export class BatchWriter {
     }
   }
 
-  /** Matches inserted rows back to requests, hands them on, then replies. */
+  /** Matches inserted rows back to requests and replies to each. */
   private settle(batch: Pending[], result: BatchResult): void {
     const ids = matchInserted(
       batch.map((p) => p.event),
       result.inserted,
     );
-    const outcomes: SubmitOutcome[] = [];
-    const committed: CommittedEvent[] = [];
-    batch.forEach((p, i) => {
-      const id = ids[i];
-      if (id === undefined) {
-        outcomes.push('duplicate');
-      } else {
-        committed.push({ id, event: p.event });
-        outcomes.push('inserted');
-      }
-    });
-
-    // Before replying: new alarms are pushed to subscribers before the 2xx.
-    if (committed.length > 0 && this.opts.onCommitted) {
-      try {
-        this.opts.onCommitted(committed, result.alarms);
-      } catch (err) {
-        this.opts.onError?.(err, { attempt: 0, batchSize: batch.length });
-      }
-    }
-    batch.forEach((p, i) => p.resolve(outcomes[i]));
+    batch.forEach((p, i) => p.resolve(ids[i] === undefined ? 'duplicate' : 'inserted'));
   }
 }

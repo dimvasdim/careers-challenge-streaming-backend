@@ -1,9 +1,10 @@
 import pg from 'pg';
 import type { IngestEvent } from '../src/core/event.js';
+import { lockAlarms } from '../src/db/alarms-repository.js';
 import { commitBatch } from '../src/db/batch-commit.js';
 
 // commitBatch against real Postgres: events and alarms in one transaction,
-// and the per-device lock under concurrent transactions.
+// and concurrent transactions (as with several worker processes).
 
 const T0 = Date.parse('2026-05-23T18:00:00.000Z');
 const SEC = 1000;
@@ -66,7 +67,46 @@ describe('commitBatch', () => {
     expect(await count('alarms')).toBe(1);
   });
 
-  it('creates one alarm when copies of a fall commit concurrently (per-device lock)', async () => {
+  it('hands out alarm ids in commit order across concurrent transactions', async () => {
+    // Another writer (think: another worker) holds the alarm lock and has
+    // inserted alarm id 1, not yet committed.
+    const other = await db.connect();
+    await other.query('BEGIN');
+    await lockAlarms(other);
+    await other.query(
+      `INSERT INTO alarms (event_id, device_id, room_id, ts, confidence, received_at)
+       VALUES ('dev_a:x', 'dev_a', 'room_000', now(), 0.5, now())`,
+    );
+
+    let done = false;
+    const pending = commitBatch(db, [fall(T0, 'dev_b')]).then((r) => {
+      done = true;
+      return r;
+    });
+    await new Promise((r) => setTimeout(r, 200));
+    expect(done).toBe(false); // waits for the lock: can't commit id 2 before id 1
+
+    await other.query('COMMIT');
+    other.release();
+    const result = await pending;
+    expect(result.alarms.map((a) => a.id)).toEqual([2]);
+  });
+
+  it('commits concurrent batches sharing duplicates in opposite order without deadlock', async () => {
+    for (let round = 0; round < 10; round++) {
+      const events = Array.from({ length: 200 }, (_, i) =>
+        fall(T0 + round * 60 * SEC + i, `dev_${i % 7}`),
+      ).map((e) => ({ ...e, type: 'heartbeat' }) as IngestEvent);
+      const results = await Promise.all([
+        commitBatch(db, events),
+        commitBatch(db, [...events].reverse()),
+      ]);
+      expect(results[0].inserted.length + results[1].inserted.length).toBe(200);
+    }
+    expect(await count('events')).toBe(2000);
+  });
+
+  it('creates one alarm when copies of a fall commit concurrently (alarm lock)', async () => {
     for (let round = 0; round < 20; round++) {
       const ts = T0 + round * 60 * SEC;
       // Two transactions at once, copies 2s apart (different event ids).

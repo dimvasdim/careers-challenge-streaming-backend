@@ -190,32 +190,13 @@ describe('BatchWriter', () => {
     expect(performance.now() - started).toBeGreaterThanOrEqual(35);
   });
 
-  it('calls onCommitted with only the inserted events, before replying', async () => {
-    const db = fakeDb();
-    const order: string[] = [];
-    const onCommitted = vi.fn(() => order.push('committed'));
-    const w = makeWriter(db, { onCommitted });
-
+  it('replies duplicate for events already in the database, inserted for new ones', async () => {
+    const w = makeWriter(fakeDb());
     await w.submit(hb(1));
-    await Promise.all([w.submit(hb(1)), w.submit(hb(2))].map((p) => p.then((r) => order.push(r))));
-
-    expect(onCommitted).toHaveBeenCalledTimes(2);
-    expect(onCommitted.mock.calls[1]).toEqual([[{ id: 2, event: hb(2) }], []]);
-    expect(order).toEqual(['committed', 'committed', 'duplicate', 'inserted']);
-  });
-
-  it('does not call onCommitted when the insert fails', async () => {
-    const db = fakeDb();
-    const onCommitted = vi.fn();
-    const onError = vi.fn();
-    const w = makeWriter(db, { onCommitted, onError, retryBaseMs: 150, retryMaxMs: 150 });
-    db.failTimes(1);
-
-    const result = w.submit(hb(1));
-    await vi.waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
-    expect(onCommitted).not.toHaveBeenCalled();
-    await result;
-    expect(onCommitted).toHaveBeenCalledTimes(1);
+    expect(await Promise.all([w.submit(hb(1)), w.submit(hb(2))])).toEqual([
+      'duplicate',
+      'inserted',
+    ]);
   });
 
   it('reports queue depth per lane before the flush runs', () => {

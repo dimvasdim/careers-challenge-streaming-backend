@@ -11,7 +11,11 @@
 - I must be able to explain every choice — prefer simple, readable code over clever code.
 
 ## Stack
-- TypeScript, NestJS with the Fastify adapter (`@nestjs/platform-fastify`), single Node process.
+- TypeScript, NestJS with the Fastify adapter (`@nestjs/platform-fastify`).
+- `node:cluster`: a primary (`src/cluster.ts`, no app code) forks `WORKERS` workers (default
+  min(cores, 4)) that share the port; each worker is the full app with its own batch writer.
+  The primary restarts crashed workers, forwards SIGTERM/SIGINT, serves merged metrics.
+  `WORKERS=1` = one process, no cluster.
 - PostgreSQL is the single source of truth (plain Postgres, no TimescaleDB): every read endpoint
   queries it; nothing but open SSE connections lives in memory.
 - Database access: plain `pg` (node-postgres) with a Pool and hand-written SQL; schema in
@@ -19,7 +23,9 @@
 - Docker Compose for Postgres + service; `make run` target in the existing Makefile.
 - `prom-client` for metrics, `pino` for structured JSON logs.
 - Do NOT use: Kafka, Redis, `@nestjs/cache-manager`, `@nestjs/microservices`, worker threads,
-  multiple workers/cluster mode, per-event OpenTelemetry spans, hosted observability services.
+  per-event OpenTelemetry spans, hosted observability services.
+- Cluster mode was added after measuring (see writeup notes): one process tops out at ~12k events/s
+  (one batch insert in flight); 4 workers ~20k/s on the dev laptop.
 
 ## Git workflow
 - Never run `git commit`, `git push`, `git reset`, `git rebase` or anything else that changes history.
@@ -44,13 +50,15 @@
 - Never return 429/503 for valid events: the generator does not retry, so a rejection = lost event.
 - Group commit: flush when idle, batch while busy. If no insert is running, write the queue on the
   next event-loop turn; while an insert is in flight, new events queue and form the next batch
-  (one insert in flight at a time, no fixed flush interval). Reply 2xx to all requests in a batch
+  (one insert in flight at a time per worker, no fixed flush interval). Reply 2xx to all requests in a batch
   after it commits. A 2xx means "persisted".
 - Backpressure is internal: priority lane for `fall_warn`, heartbeats may wait; expose queue depth.
 - Duplicates: identity key `(device_id, ts, seq)`. `seq` may have gaps — never wait for missing seqs.
   Postgres is the only dedup: events table has `UNIQUE (device_id, ts, seq)`; the batch insert uses
   `ON CONFLICT DO NOTHING RETURNING`, and rows not returned are duplicates. Only inserted
   fall_warns reach the fall dedup. No in-memory seen-key set.
+- Each batch is sorted by `(device_id, ts, seq)` before the insert, so concurrent batches from
+  different workers that share duplicates can't deadlock on the unique index.
 - One transaction per batch (`db/batch-commit.ts`): insert events, then create/update the alarms of
   the new fall_warns, then COMMIT. Events and alarms are never out of sync after a crash.
 
@@ -62,7 +70,8 @@
   `(room_id, ts) INCLUDE (in_room, id) WHERE type = 'presence'`; `alarms (ts)`, `alarms (device_id, ts)`.
 - Restart: nothing to recover — a restarted process serves correct reads immediately. SSE clients
   reconnect with `Last-Event-ID` and catch up from the alarms table.
-- Pool: one connection for the batch writer, the rest for reads (`DB_POOL_SIZE`, default 6).
+- Pool per worker: one connection for the batch writer, the rest for reads (`DB_POOL_SIZE`,
+  default 4), plus one dedicated connection for the `AlarmListener`.
 
 ## Device health
 `GET /devices/{device_id}/health` → `{ last_heartbeat_ts, availability_5m }`
@@ -92,12 +101,17 @@
   Window is measured from `firstTs`, not from the last event. Matched against every nearby alarm
   in the table, so a late replayed fall can't break dedup of a live one.
   5s = "a few seconds" of jitter (README's 1s is delivery latency, unrelated).
-- In the batch transaction: per-device `pg_advisory_xact_lock` (sorted, no deadlocks) → load
-  nearby alarms → pure `planAlarms` → one upsert. The lock makes "look, then insert" safe even
-  with concurrent transactions (tested in `test/batch-commit.e2e-spec.ts`).
+- In the batch transaction (only if it has new fall_warns): one global `pg_advisory_xact_lock`
+  (`lockAlarms`) → load nearby alarms → pure `planAlarms` → one upsert → `pg_notify('alarms')`.
+  The lock makes "look, then insert" safe across workers AND makes `alarms.id` order = commit
+  order, so `id > Last-Event-ID` catch-up can't skip a late commit (tested in
+  `test/batch-commit.e2e-spec.ts`). Falls are rare, so serializing them is cheap.
 - Incident `ts` = first fall_warn's ts (original timestamp). Late earlier copies inside the window merge.
 - `event_id = ${device_id}:${firstTs}`, `alarms` table with UNIQUE(event_id).
-  Committed BEFORE being pushed to subscribers (pushed after COMMIT, before the 2xx).
+  Committed BEFORE being pushed: NOTIFY is delivered only on COMMIT, in commit order. Every
+  worker's `AlarmListener` (`src/db/alarm-listener.ts`) then reads `id > lastSeenId` and pushes
+  to its own SSE clients, so clients on any worker get alarms from every worker. The notify has
+  no payload; a missed one (listener reconnect) is healed by the next read.
 - Live feed over SSE (Nest `@Sse()` controller route), ordered per room, within 1s of ingestion.
   SSE event id = `alarms.id` (commit order), so `Last-Event-ID` catch-up also gets late replayed
   alarms. Catch-up always from Postgres (`id > last`); `AlarmHub` only fans out to open connections.
@@ -105,10 +119,15 @@
 - `GET /alarms?since=` is a plain query on `alarms (ts)`; `since` = epoch seconds or ISO date.
 
 ## Observability
-- `/metrics` (prom-client): events ingested per type, rejected (by reason), duplicates dropped,
-  seq gaps, queue depth per priority, batch size/lag, alarm latency histogram (ingest → SSE, p95),
-  SSE subscribers, read query latency, default Node metrics (event-loop lag).
-- `pino` JSON logs for startup, backpressure, rejected events. Never log every event.
+- `/metrics` (prom-client, `src/metrics/metrics.ts`): events ingested per type, rejected (by
+  reason), duplicates dropped, queue depth per lane, persist latency per lane, batch size and
+  commit time, alarm latency (ingest → SSE push, observed once per worker), SSE subscribers, read
+  query latency, default Node metrics (event-loop lag). With workers, the primary merges all
+  workers (`AggregatorRegistry`, localhost:`METRICS_PORT`) and each worker's `/metrics` returns that.
+  No seq-gap metric: it needs per-device state, which workers can't see whole.
+- `pino` JSON logs (`src/logger.ts`, Nest logger adapter) for startup, worker restarts,
+  backpressure (queue ≥ `BACKPRESSURE_LOG_DEPTH`), rejected events (one summary per 5s).
+  Never log every event.
 - Optional Prometheus + Grafana in a Compose profile — not required.
 
 ## Testing
@@ -116,6 +135,9 @@
   concurrency) in e2e tests against the `teton_test` database.
 - Run `eval/check.py` (baseline, burst, offline, adversarial) after each milestone.
 - Load-test the 10x burst early; watch event-loop lag and alarm p95.
+- On Windows, Docker Desktop's port forwarding adds seconds of latency: load-test the service
+  natively (Postgres can stay in Docker), and run several `npm run load` clients in parallel
+  (one client tops out at ~9k/s).
 
 ## Build order
 1. Ingest + validation + group commit to Postgres

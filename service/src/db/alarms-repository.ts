@@ -27,25 +27,35 @@ function toAlarm(r: AlarmRow): Alarm {
   };
 }
 
+// Any constant works; it only has to be the same in every process.
+const ALARMS_LOCK_KEY = 0x616c726d; // "alrm"
+
 /**
- * Per-device advisory locks, held until the transaction ends. Two transactions
- * handling falls of the same device then run "look for a nearby alarm, then
- * insert" one after the other, so two copies of one fall can't both create an
- * alarm. Different devices never wait for each other. Locks are taken in key
- * order, so two transactions locking several devices can't deadlock.
- * (A hash collision only makes two devices wait for each other occasionally.)
+ * One advisory lock for all alarm writes, held until the transaction ends.
+ * Transactions that create or update alarms run one after the other, which
+ * gives two guarantees even with several worker processes writing at once:
+ * - "look for a nearby alarm, then insert" is safe: two copies of one fall
+ *   can't both create an alarm;
+ * - alarms.id order is commit order: an alarm with a higher id is never
+ *   visible before a lower one, so SSE catch-up (`id > Last-Event-ID`) can't
+ *   skip an alarm that committed late.
+ * Only batches with new falls take it, and falls are rare.
  */
-export async function lockDevices(
-  db: pg.PoolClient,
-  deviceIds: string[],
-): Promise<void> {
-  await db.query(
-    `SELECT pg_advisory_xact_lock(key)
-     FROM (SELECT DISTINCT hashtext(device_id) AS key
-           FROM unnest($1::text[]) AS device_id
-           ORDER BY key OFFSET 0) AS keys`,
-    [deviceIds],
-  );
+export async function lockAlarms(db: pg.PoolClient): Promise<void> {
+  await db.query('SELECT pg_advisory_xact_lock($1)', [ALARMS_LOCK_KEY]);
+}
+
+/** Wakes the AlarmListener of every process. Delivered only if the transaction commits. */
+export async function notifyAlarms(db: pg.PoolClient): Promise<void> {
+  await db.query(`SELECT pg_notify('${ALARMS_CHANNEL}', '')`);
+}
+
+export const ALARMS_CHANNEL = 'alarms';
+
+/** Highest alarm id so far (0 if none): where a new listener starts. */
+export async function maxAlarmId(db: Db): Promise<number> {
+  const { rows } = await db.query<{ id: string | null }>('SELECT max(id) AS id FROM alarms');
+  return Number(rows[0].id ?? 0);
 }
 
 /** Alarms of these devices with ts within the dedup window of [fromMs, toMs]. */

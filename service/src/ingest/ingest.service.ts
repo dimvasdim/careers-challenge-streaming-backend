@@ -5,7 +5,6 @@ import {
   type OnApplicationShutdown,
 } from '@nestjs/common';
 import type pg from 'pg';
-import { AlarmsService } from '../alarms/alarms.service.js';
 import { loadConfig } from '../config.js';
 import { BatchWriter } from '../core/batch-writer.js';
 import { validateEvent } from '../core/validate.js';
@@ -23,7 +22,7 @@ export class IngestService implements EventIngest, OnApplicationShutdown {
   private backpressured = false;
   private rejectedSinceLog = new Map<string, number>();
 
-  constructor(@Inject(PG_POOL) pool: pg.Pool, alarms: AlarmsService) {
+  constructor(@Inject(PG_POOL) pool: pg.Pool) {
     const config = loadConfig();
     this.writer = new BatchWriter({
       // Events and the alarms their falls create commit in one transaction.
@@ -33,8 +32,6 @@ export class IngestService implements EventIngest, OnApplicationShutdown {
         metrics.batchCommitted(events.length, (performance.now() - start) / 1000);
         return result;
       },
-      // After the commit, before the requests get their 2xx: push new alarms live.
-      onCommitted: (_committed, newAlarms) => alarms.publish(newAlarms),
       maxBatchSize: config.batchMaxSize,
       onError: (err, { attempt, batchSize }) => {
         const message = err instanceof Error ? err.message : String(err);

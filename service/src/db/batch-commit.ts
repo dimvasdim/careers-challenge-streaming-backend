@@ -4,7 +4,8 @@ import type { IngestEvent } from '../core/event.js';
 import { type FallEvent, planAlarms } from '../core/fall-incidents.js';
 import {
   loadNearbyAlarms,
-  lockDevices,
+  lockAlarms,
+  notifyAlarms,
   upsertAlarms,
 } from './alarms-repository.js';
 import { insertEvents } from './events-repository.js';
@@ -14,11 +15,19 @@ import { insertEvents } from './events-repository.js';
  * new fall_warns create or update. Events and alarms commit together, so a
  * crash can never leave a fall persisted without its alarm. Only newly
  * inserted events count: a replayed duplicate never reaches the dedup.
+ *
+ * Several of these can run at once (one per worker process): see lockAlarms
+ * for alarms, and the sort below for duplicate events.
  */
 export async function commitBatch(
   pool: pg.Pool,
-  events: IngestEvent[],
+  batch: IngestEvent[],
 ): Promise<BatchResult> {
+  // Rows are inserted in array order, each taking a lock on its unique key.
+  // In one fixed order, two batches sharing duplicates (a replay arriving at
+  // two workers) wait for each other instead of deadlocking.
+  const events = [...batch].sort(byIdentityKey);
+
   const client = await pool.connect();
   let broken: Error | undefined;
   try {
@@ -32,8 +41,8 @@ export async function commitBatch(
 
     let alarms: BatchResult['alarms'] = [];
     if (falls.length > 0) {
+      await lockAlarms(client);
       const deviceIds = [...new Set(falls.map((f) => f.deviceId))];
-      await lockDevices(client, deviceIds);
       const ts = falls.map((f) => f.tsMs);
       const existing = await loadNearbyAlarms(
         client,
@@ -46,6 +55,7 @@ export async function commitBatch(
       plan.upserts.sort((a, b) => a.tsMs - b.tsMs);
       await upsertAlarms(client, plan.upserts);
       alarms = plan.created.sort((a, b) => a.id - b.id);
+      if (alarms.length > 0) await notifyAlarms(client);
     }
 
     await client.query('COMMIT');
@@ -53,7 +63,7 @@ export async function commitBatch(
   } catch (err) {
     // The BatchWriter retries the whole batch; nothing of it was committed.
     // (If only the COMMIT reply was lost, the retry finds every event already
-    // inserted: the alarms exist but are not pushed live; SSE catch-up has them.)
+    // inserted; the alarms were committed and notified, so they still go out.)
     await client.query('ROLLBACK').catch((rollbackErr: Error) => {
       broken = rollbackErr; // connection is gone: don't return it to the pool
     });
@@ -61,4 +71,9 @@ export async function commitBatch(
   } finally {
     client.release(broken);
   }
+}
+
+function byIdentityKey(a: IngestEvent, b: IngestEvent): number {
+  if (a.deviceId !== b.deviceId) return a.deviceId < b.deviceId ? -1 : 1;
+  return a.tsMs - b.tsMs || a.seq - b.seq;
 }

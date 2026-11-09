@@ -30,7 +30,9 @@ export class PinoNestLogger implements LoggerService {
 }
 
 function write(level: Level, message: unknown, fields: Record<string, unknown>): void {
-  if (typeof message === 'object' && message !== null) {
+  if (message instanceof Error) {
+    log[level]({ ...fields, err: message }, message.message); // pino serializes err with its stack
+  } else if (typeof message === 'object' && message !== null) {
     log[level]({ ...fields, ...message });
   } else {
     log[level](fields, String(message));

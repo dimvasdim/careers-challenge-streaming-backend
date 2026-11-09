@@ -1,3 +1,4 @@
+import cluster from 'node:cluster';
 import client from 'prom-client';
 import { EVENT_TYPES, type EventType } from '../core/event.js';
 
@@ -8,6 +9,10 @@ import { EVENT_TYPES, type EventType } from '../core/event.js';
 
 const register = client.register;
 client.collectDefaultMetrics({ register }); // includes nodejs_eventloop_lag_* (event-loop lag)
+
+// In a worker, constructing an AggregatorRegistry is what makes this process
+// answer the primary's "send me your metrics" IPC requests (see cluster.ts).
+if (cluster.isWorker) new client.AggregatorRegistry();
 
 const ingested = new client.Counter({
   name: 'events_ingested_total',
