@@ -9,6 +9,7 @@ import type pg from 'pg';
 import { computeHealth, type DeviceHealth } from '../core/device-health.js';
 import { PG_POOL } from '../db/database.module.js';
 import { loadHealthInput } from '../db/read-queries.js';
+import { metrics } from '../metrics/metrics.js';
 
 @Controller('devices')
 export class DeviceHealthController {
@@ -17,7 +18,7 @@ export class DeviceHealthController {
   @Get(':deviceId/health')
   async health(@Param('deviceId') deviceId: string): Promise<DeviceHealth> {
     const now = Date.now();
-    const input = await loadHealthInput(this.pool, deviceId, now);
+    const input = await metrics.timeRead('health', () => loadHealthInput(this.pool, deviceId, now));
     if (!input) throw new NotFoundException(`unknown device ${deviceId}`);
     return computeHealth(input, now);
   }

@@ -7,6 +7,7 @@ export interface Config {
   dbPoolSize: number;
   batchMaxSize: number;
   sseKeepaliveMs: number;
+  backpressureLogDepth: number;
 }
 
 function int(name: string, fallback: number): number {
@@ -30,5 +31,7 @@ export function loadConfig(): Config {
     batchMaxSize: int('BATCH_MAX_SIZE', 2000),
     // SSE keepalive comment, so idle connections survive proxies and load balancers.
     sseKeepaliveMs: int('SSE_KEEPALIVE_MS', 15_000),
+    // Queued events at which a "backpressure" warning is logged (cleared below half).
+    backpressureLogDepth: int('BACKPRESSURE_LOG_DEPTH', 5_000),
   };
 }

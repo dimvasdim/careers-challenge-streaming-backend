@@ -15,6 +15,7 @@ import {
 } from '../core/room-occupancy.js';
 import { PG_POOL } from '../db/database.module.js';
 import { loadPresencePoints } from '../db/read-queries.js';
+import { metrics } from '../metrics/metrics.js';
 
 @Controller('rooms')
 export class RoomOccupancyController {
@@ -31,7 +32,9 @@ export class RoomOccupancyController {
     }
     const windowMs = OCCUPANCY_WINDOWS[window];
     const now = Date.now();
-    const points = await loadPresencePoints(this.pool, roomId, now - windowMs);
+    const points = await metrics.timeRead('occupancy', () =>
+      loadPresencePoints(this.pool, roomId, now - windowMs),
+    );
     return computeOccupancy(points, windowMs, now);
   }
 }

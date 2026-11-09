@@ -105,4 +105,38 @@ describe('POST /events', () => {
     expect(await count()).toBe(300);
     app = undefined as unknown as NestFastifyApplication; // already closed
   });
+
+  it('exposes ingest counters on /metrics', async () => {
+    // Counters are process-wide (shared by every test), so compare before/after.
+    const scrape = async () => (await fastify.inject({ method: 'GET', url: '/metrics' })).body;
+    const value = (text: string, series: string) => {
+      const line = text.split('\n').find((l) => l.startsWith(series + ' '));
+      return line ? Number(line.slice(series.length + 1)) : 0;
+    };
+    const before = await scrape();
+
+    const heartbeat = event(1);
+    await post(heartbeat);
+    await post(heartbeat); // duplicate
+    await post({ ...event(2), type: 'nope' });
+    await fastify.inject({
+      method: 'POST',
+      url: '/events',
+      headers: { 'content-type': 'application/json' },
+      payload: '{not json',
+    });
+
+    const res = await fastify.inject({ method: 'GET', url: '/metrics' });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toContain('text/plain');
+    const after = res.body;
+    const delta = (series: string) => value(after, series) - value(before, series);
+    expect(delta('events_ingested_total{type="heartbeat"}')).toBe(1);
+    expect(delta('events_duplicate_total')).toBe(1);
+    expect(delta('events_rejected_total{reason="unknown_type"}')).toBe(1);
+    expect(delta('events_rejected_total{reason="invalid_json"}')).toBe(1);
+    expect(delta('ingest_persist_seconds_count{lane="normal"}')).toBe(2);
+    expect(after).toContain('ingest_queue_depth{lane="priority"} 0');
+    expect(after).toContain('nodejs_eventloop_lag_p99_seconds');
+  });
 });

@@ -19,7 +19,7 @@ export class HttpIngestTransport implements OnModuleInit {
 
   constructor(
     private readonly adapterHost: HttpAdapterHost,
-    ingestService: IngestService,
+    private readonly ingestService: IngestService,
   ) {
     this.ingest = ingestService;
   }
@@ -43,6 +43,7 @@ export class HttpIngestTransport implements OnModuleInit {
         const status = error.statusCode ?? 500;
         const reason =
           status === 400 && error.code?.startsWith('FST_ERR_CTP') ? 'invalid_json' : error.code;
+        if (status < 500) this.ingestService.countRejected(reason ?? 'invalid_body');
         return sendJson(reply, status, JSON.stringify({ error: reason ?? 'internal_error' }));
       },
     });
