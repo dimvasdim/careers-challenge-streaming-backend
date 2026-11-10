@@ -1,4 +1,4 @@
-# CLAUDE.md — Teton streaming backend challenge
+# CLAUDE.md - Teton streaming backend challenge
 
 ## Challenge context
 - Challenge: https://github.com/Teton-ai/careers-challenge-streaming-backend
@@ -8,7 +8,7 @@
 - Grading: aggregation correctness 30, burst/backpressure 20, restart/recovery 15,
   alarm latency p95 15, code quality/design 15, observability 5. Pass bar 75/100.
 - Not wanted: Kafka without justification, hand-rolled consensus, dashboards, long architecture prose.
-- I must be able to explain every choice — prefer simple, readable code over clever code.
+- I must be able to explain every choice - prefer simple, readable code over clever code.
 
 ## Stack
 - TypeScript, NestJS with the Fastify adapter (`@nestjs/platform-fastify`).
@@ -34,9 +34,9 @@
 - `git status` and `git diff` are fine to run.
 
 ## Code structure
-- `src/core/` — plain TypeScript, no decorators, no Nest imports: validation, batching, the
+- `src/core/` - plain TypeScript, no decorators, no Nest imports: validation, batching, the
   health/occupancy math, fall dedup, SSE subscription merge. Pure where possible and unit-tested.
-- `src/db/` — hand-written SQL. Rule: SQL selects the rows, `core/` does the math.
+- `src/db/` - hand-written SQL. Rule: SQL selects the rows, `core/` does the math.
 - Nest is a thin shell: modules (Ingest, Health, Occupancy, Alarms, Metrics), shutdown drain,
   the read endpoints and SSE.
 - The ingest hot path must not go through guards/interceptors/pipes per event.
@@ -53,7 +53,7 @@
   (one insert in flight at a time per worker, no fixed flush interval). Reply 2xx to all requests in a batch
   after it commits. A 2xx means "persisted".
 - Backpressure is internal: priority lane for `fall_warn`, heartbeats may wait; expose queue depth.
-- Duplicates: identity key `(device_id, ts, seq)`. `seq` may have gaps — never wait for missing seqs.
+- Duplicates: identity key `(device_id, ts, seq)`. `seq` may have gaps - never wait for missing seqs.
   Postgres is the only dedup: events table has `UNIQUE (device_id, ts, seq)`; the batch insert uses
   `ON CONFLICT DO NOTHING RETURNING`, and rows not returned are duplicates. Only inserted
   fall_warns reach the fall dedup. No in-memory seen-key set.
@@ -68,7 +68,7 @@
   rows: health ~0.5 ms, occupancy 1h ~0.3 ms; `service/scripts/read-bench/`).
 - Indexes: `UNIQUE (device_id, ts, seq)` also serves device ranges; partial covering index
   `(room_id, ts) INCLUDE (in_room, id) WHERE type = 'presence'`; `alarms (ts)`, `alarms (device_id, ts)`.
-- Restart: nothing to recover — a restarted process serves correct reads immediately. SSE clients
+- Restart: nothing to recover - a restarted process serves correct reads immediately. SSE clients
   reconnect with `Last-Event-ID` and catch up from the alarms table.
 - Pool per worker: one connection for the batch writer, the rest for reads (`DB_POOL_SIZE`,
   default 4), plus one dedicated connection for the `AlarmListener`.
@@ -128,12 +128,15 @@
 - `pino` JSON logs (`src/logger.ts`, Nest logger adapter) for startup, worker restarts,
   backpressure (queue ≥ `BACKPRESSURE_LOG_DEPTH`), rejected events (one summary per 5s).
   Never log every event.
-- Optional Prometheus + Grafana in a Compose profile — not required.
+- Optional Prometheus + Grafana in a Compose profile - not required.
 
 ## Testing
 - Unit tests for the pure core functions; SQL behaviour (late events, carry-in, clock skew,
   concurrency) in e2e tests against the `teton_test` database.
 - Run `eval/check.py` (baseline, burst, offline, adversarial) after each milestone.
+- Restart: `node scripts/restart-test.ts` (Compose stack running) SIGKILLs the service mid-load;
+  passes if every SSE consumer got exactly the committed alarms (Last-Event-ID reconnect) and
+  every 2xx event is in Postgres.
 - Load-test the 10x burst early; watch event-loop lag and alarm p95.
 - On Windows, Docker Desktop's port forwarding adds seconds of latency: load-test the service
   natively (Postgres can stay in Docker), and run several `npm run load` clients in parallel

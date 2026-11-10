@@ -108,8 +108,14 @@ const newStats = (label: string): PhaseStats => ({
 let inFlight = 0;
 let maxInFlight = 0;
 
+// (device_id, seq) of every event acknowledged as inserted: each must be in Postgres.
+const ackedDeviceIds: string[] = [];
+const ackedSeqs: number[] = [];
+
 function send(stats: PhaseStats, scheduledAt: number, deviceIdx: number): Promise<void> {
-  const { type, body } = makeEvent(devices[deviceIdx]);
+  const device = devices[deviceIdx];
+  const { type, body } = makeEvent(device);
+  const seq = device.seq;
   stats.sent++;
   inFlight++;
   maxInFlight = Math.max(maxInFlight, inFlight);
@@ -118,6 +124,10 @@ function send(stats: PhaseStats, scheduledAt: number, deviceIdx: number): Promis
     const done = (outcome: keyof PhaseStats) => {
       inFlight--;
       (stats[outcome] as number)++;
+      if (outcome === 'ok') {
+        ackedDeviceIds.push(device.id);
+        ackedSeqs.push(seq);
+      }
       if (outcome === 'ok' || outcome === 'duplicate') {
         const ms = performance.now() - scheduledAt;
         stats.latency.push(ms);
@@ -222,18 +232,27 @@ async function main(): Promise<void> {
       `5xx ${sum('serverError')}  failed ${sum('failed')}  skipped ${sum('skipped')}  max in-flight ${maxInFlight}`,
   );
 
-  // Every 2xx must be durable: compare with the rows stored for this run.
+  // Every 2xx must be durable: look up each acknowledged event. Extra rows are
+  // fine: an event can commit and then lose its reply (timeout, process killed).
   const db = new pg.Client({ connectionString: args.db });
   await db.connect();
-  const { rows } = await db.query<{ n: number }>(
+  const lost = await db.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM unnest($1::text[], $2::bigint[]) AS a(device_id, seq)
+     WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.device_id = a.device_id AND e.seq = a.seq)`,
+    [ackedDeviceIds, ackedSeqs],
+  );
+  const stored = await db.query<{ n: number }>(
     'SELECT count(*)::int AS n FROM events WHERE device_id LIKE $1',
     [`load_${runId}_%`],
   );
   await db.end();
-  const stored = rows[0].n;
-  const acked = sum('ok');
-  console.log(`rows in Postgres ${stored}  acked as inserted ${acked}  ${stored === acked ? 'OK' : 'MISMATCH'}`);
-  if (stored !== acked || sum('failed') + sum('serverError') + sum('rejected') > 0) process.exitCode = 1;
+  const lostCount = lost.rows[0].n;
+  const acked = ackedSeqs.length;
+  console.log(
+    `acked as inserted ${acked}  missing in Postgres ${lostCount}  ${lostCount === 0 ? 'OK' : 'LOST EVENTS'}` +
+      `  |  stored without a 2xx (reply lost) ${stored.rows[0].n - (acked - lostCount)}`,
+  );
+  if (lostCount > 0 || sum('failed') + sum('serverError') + sum('rejected') > 0) process.exitCode = 1;
 }
 
 main().catch((err: unknown) => {
