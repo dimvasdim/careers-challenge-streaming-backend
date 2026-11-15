@@ -24,6 +24,11 @@ function int(name: string, fallback: number): number {
   return value;
 }
 
+function atLeast(name: string, value: number, min: number): number {
+  if (value < min) throw new Error(`${name} must be at least ${min}, got ${value}`);
+  return value;
+}
+
 export function loadConfig(): Config {
   return {
     port: int('PORT', 8080),
@@ -35,10 +40,10 @@ export function loadConfig(): Config {
     metricsPort: int('METRICS_PORT', 9464),
     databaseUrl:
       process.env.DATABASE_URL ?? 'postgres://teton:teton@localhost:5433/teton',
-    // Per worker. The batch writer uses one connection at a time (one insert in
-    // flight); the rest serve read endpoints, so reads never queue behind a
-    // batch insert. Plus one connection per worker for the AlarmListener.
-    dbPoolSize: int('DB_POOL_SIZE', 4),
+    // Per worker, at least 2: one connection in the batch writer's own pool (one
+    // insert in flight), the rest in the read pool, so a batch commit never
+    // waits behind reads. Plus one connection per worker for the AlarmListener.
+    dbPoolSize: atLeast('DB_POOL_SIZE', int('DB_POOL_SIZE', 4), 2),
     batchMaxSize: int('BATCH_MAX_SIZE', 2000),
     // SSE keepalive comment, so idle connections survive proxies and load balancers.
     sseKeepaliveMs: int('SSE_KEEPALIVE_MS', 15_000),

@@ -10,4 +10,5 @@ export type IngestResult =
  */
 export interface EventIngest {
   ingest(body: unknown): Promise<IngestResult>;
+  countRejected(reason: string): void;
 }

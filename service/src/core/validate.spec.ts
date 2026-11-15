@@ -1,4 +1,4 @@
-import { ACCEPT_WINDOW_MS, validateEvent } from './validate.js';
+import { ACCEPT_WINDOW_MS, MAX_ID_LENGTH, validateEvent } from './validate.js';
 
 const NOW = Date.parse('2026-05-23T18:53:49.123Z');
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -77,6 +77,24 @@ describe('validateEvent', () => {
     expect(reasonOf({ ...valid.heartbeat, seq: '42' })).toBe('invalid_field');
     expect(reasonOf({ ...valid.heartbeat, seq: -1 })).toBe('invalid_field');
     expect(reasonOf({ ...valid.heartbeat, seq: 1.5 })).toBe('invalid_field');
+  });
+
+  // Values Postgres would refuse: one of them would fail its batch on every retry.
+  it('rejects ids Postgres could not store or index', () => {
+    expect(reasonOf({ ...valid.heartbeat, device_id: 'dev\u00000001' })).toBe('invalid_field');
+    expect(reasonOf({ ...valid.heartbeat, room_id: 'room\u0000' })).toBe('invalid_field');
+    const id = (n: number) => 'd'.repeat(n);
+    expect(reasonOf({ ...valid.heartbeat, device_id: id(MAX_ID_LENGTH) })).toBe('ok');
+    expect(reasonOf({ ...valid.heartbeat, device_id: id(MAX_ID_LENGTH + 1) })).toBe('invalid_field');
+    expect(reasonOf({ ...valid.heartbeat, room_id: id(MAX_ID_LENGTH + 1) })).toBe('invalid_field');
+  });
+
+  it('accepts rssi only within the 32-bit INTEGER range', () => {
+    expect(reasonOf({ ...valid.net_status, rssi: -(2 ** 31) })).toBe('ok');
+    expect(reasonOf({ ...valid.net_status, rssi: 2 ** 31 - 1 })).toBe('ok');
+    expect(reasonOf({ ...valid.net_status, rssi: 2 ** 31 })).toBe('invalid_field');
+    expect(reasonOf({ ...valid.net_status, rssi: 1e10 })).toBe('invalid_field');
+    expect(reasonOf({ ...valid.net_status, rssi: '-68' })).toBe('invalid_field');
   });
 
   it('rejects unknown types', () => {

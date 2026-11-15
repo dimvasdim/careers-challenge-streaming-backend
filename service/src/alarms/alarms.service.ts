@@ -11,7 +11,7 @@ import { AlarmHub } from '../core/alarm-hub.js';
 import type { Alarm } from '../core/fall-incidents.js';
 import { AlarmListener } from '../db/alarm-listener.js';
 import { listAlarmsSince, loadAlarmsAfter } from '../db/alarms-repository.js';
-import { PG_POOL } from '../db/database.module.js';
+import { PG_READ_POOL } from '../db/database.module.js';
 import { metrics } from '../metrics/metrics.js';
 
 /**
@@ -26,7 +26,7 @@ export class AlarmsService implements OnApplicationBootstrap, OnApplicationShutd
   readonly hub = new AlarmHub();
   private readonly listener: AlarmListener;
 
-  constructor(@Inject(PG_POOL) private readonly pool: pg.Pool) {
+  constructor(@Inject(PG_READ_POOL) private readonly pool: pg.Pool) {
     metrics.setSubscriberSource(() => this.hub.subscriberCount());
     this.listener = new AlarmListener({
       connectionString: loadConfig().databaseUrl,

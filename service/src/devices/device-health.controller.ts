@@ -7,13 +7,13 @@ import {
 } from '@nestjs/common';
 import type pg from 'pg';
 import { computeHealth, type DeviceHealth } from '../core/device-health.js';
-import { PG_POOL } from '../db/database.module.js';
+import { PG_READ_POOL } from '../db/database.module.js';
 import { loadHealthInput } from '../db/read-queries.js';
 import { metrics } from '../metrics/metrics.js';
 
 @Controller('devices')
 export class DeviceHealthController {
-  constructor(@Inject(PG_POOL) private readonly pool: pg.Pool) {}
+  constructor(@Inject(PG_READ_POOL) private readonly pool: pg.Pool) {}
 
   @Get(':deviceId/health')
   async health(@Param('deviceId') deviceId: string): Promise<DeviceHealth> {

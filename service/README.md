@@ -29,6 +29,7 @@
 
 ```bash
 $ npm install
+$ cp .env.example .env   # the start scripts load .env (Docker Compose doesn't use it)
 ```
 
 ## Compile and run the project

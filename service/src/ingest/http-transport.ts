@@ -1,7 +1,6 @@
 import { Injectable, type OnModuleInit } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
 import type { FastifyError, FastifyInstance, FastifyReply } from 'fastify';
-import type { EventIngest } from './event-ingest.js';
 import { IngestService } from './ingest.service.js';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
@@ -15,14 +14,12 @@ const DUPLICATE = '{"status":"duplicate"}';
  */
 @Injectable()
 export class HttpIngestTransport implements OnModuleInit {
-  private readonly ingest: EventIngest;
-
+  // Uses only the EventIngest methods of IngestService (ingest, countRejected),
+  // the contract any transport (e.g. MQTT later) relies on.
   constructor(
     private readonly adapterHost: HttpAdapterHost,
     private readonly ingestService: IngestService,
-  ) {
-    this.ingest = ingestService;
-  }
+  ) {}
 
   onModuleInit(): void {
     const fastify = this.adapterHost.httpAdapter.getInstance<FastifyInstance>();
@@ -32,7 +29,7 @@ export class HttpIngestTransport implements OnModuleInit {
       url: '/events',
       bodyLimit: 16 * 1024,
       handler: async (request, reply) => {
-        const result = await this.ingest.ingest(request.body);
+        const result = await this.ingestService.ingest(request.body);
         if (result.status === 'rejected') {
           return sendJson(reply, 400, `{"error":"${result.reason}"}`);
         }

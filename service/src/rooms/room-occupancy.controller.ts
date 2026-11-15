@@ -13,13 +13,13 @@ import {
   OCCUPANCY_WINDOWS,
   type RoomOccupancy,
 } from '../core/room-occupancy.js';
-import { PG_POOL } from '../db/database.module.js';
+import { PG_READ_POOL } from '../db/database.module.js';
 import { loadPresencePoints } from '../db/read-queries.js';
 import { metrics } from '../metrics/metrics.js';
 
 @Controller('rooms')
 export class RoomOccupancyController {
-  constructor(@Inject(PG_POOL) private readonly pool: pg.Pool) {}
+  constructor(@Inject(PG_READ_POOL) private readonly pool: pg.Pool) {}
 
   /** A room without presence events (or unknown) is absent: { false, 0 }. */
   @Get(':roomId/occupancy')

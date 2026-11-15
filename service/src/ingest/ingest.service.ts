@@ -8,7 +8,7 @@ import type pg from 'pg';
 import { loadConfig } from '../config.js';
 import { BatchWriter } from '../core/batch-writer.js';
 import { validateEvent } from '../core/validate.js';
-import { PG_POOL } from '../db/database.module.js';
+import { PG_WRITE_POOL } from '../db/database.module.js';
 import { commitBatch } from '../db/batch-commit.js';
 import { metrics } from '../metrics/metrics.js';
 import type { EventIngest, IngestResult } from './event-ingest.js';
@@ -22,7 +22,7 @@ export class IngestService implements EventIngest, OnApplicationShutdown {
   private backpressured = false;
   private rejectedSinceLog = new Map<string, number>();
 
-  constructor(@Inject(PG_POOL) pool: pg.Pool) {
+  constructor(@Inject(PG_WRITE_POOL) pool: pg.Pool) {
     const config = loadConfig();
     this.writer = new BatchWriter({
       // Events and the alarms their falls create commit in one transaction.
@@ -86,7 +86,7 @@ export class IngestService implements EventIngest, OnApplicationShutdown {
   }
 
   // Runs after the HTTP server has closed (no new requests) and before the
-  // global DatabaseModule closes the pool.
+  // global DatabaseModule closes the pools.
   async onApplicationShutdown(): Promise<void> {
     clearInterval(this.monitor);
     const depth = this.writer.queueDepth();

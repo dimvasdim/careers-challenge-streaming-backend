@@ -40,7 +40,8 @@
 - Nest is a thin shell: modules (Ingest, Health, Occupancy, Alarms, Metrics), shutdown drain,
   the read endpoints and SSE.
 - The ingest hot path must not go through guards/interceptors/pipes per event.
-- Ingest sits behind an interface so another transport (MQTT) can be added later.
+- `IngestService` implements the `EventIngest` interface (`ingest`, `countRejected`) that transports
+  use, so another transport (MQTT) can be added later.
 - The service lives in service/; challenge files (event_generator/, eval/, docs/) stay untouched.
 
 ## Ingest
@@ -70,8 +71,9 @@
   `(room_id, ts) INCLUDE (in_room, id) WHERE type = 'presence'`; `alarms (ts)`, `alarms (device_id, ts)`.
 - Restart: nothing to recover - a restarted process serves correct reads immediately. SSE clients
   reconnect with `Last-Event-ID` and catch up from the alarms table.
-- Pool per worker: one connection for the batch writer, the rest for reads (`DB_POOL_SIZE`,
-  default 4), plus one dedicated connection for the `AlarmListener`.
+- Two pools per worker (`DB_POOL_SIZE` connections in total, default 4, min 2): `PG_WRITE_POOL`
+  (1 connection, batch writer only, so commits never wait behind reads) and `PG_READ_POOL` (the rest),
+  plus one dedicated connection for the `AlarmListener`.
 
 ## Device health
 `GET /devices/{device_id}/health` → `{ last_heartbeat_ts, availability_5m }`

@@ -19,7 +19,18 @@ const ISO_TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{
 
 const reject = (reason: RejectReason): ValidationResult => ({ ok: false, reason });
 
-const isNonEmptyString = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+// The checks below also keep out values Postgres would refuse: such an event
+// would fail its whole batch on every retry and stall ingest for that worker.
+
+// IDs are short in practice; the cap keeps them well under the btree index
+// row limit (~2.7 KB). Postgres TEXT can't store a NUL character.
+export const MAX_ID_LENGTH = 128;
+const isId = (v: unknown): v is string =>
+  typeof v === 'string' && v.length > 0 && v.length <= MAX_ID_LENGTH && !v.includes('\0');
+
+// rssi is stored as INTEGER (32-bit).
+const isInt32 = (v: unknown): v is number =>
+  Number.isInteger(v) && (v as number) >= -(2 ** 31) && (v as number) < 2 ** 31;
 const isUnitInterval = (v: unknown): v is number =>
   typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1;
 
@@ -38,7 +49,7 @@ export function validateEvent(body: unknown, nowMs: number): ValidationResult {
     if (b[field] === undefined || b[field] === null) return reject('missing_field');
   }
 
-  if (!isNonEmptyString(b.device_id) || !isNonEmptyString(b.room_id)) {
+  if (!isId(b.device_id) || !isId(b.room_id)) {
     return reject('invalid_field');
   }
   if (typeof b.type !== 'string' || !(EVENT_TYPES as readonly string[]).includes(b.type)) {
@@ -86,7 +97,7 @@ export function validateEvent(body: unknown, nowMs: number): ValidationResult {
       return { ok: true, event: { ...envelope, type, confidence: b.confidence } };
     case 'net_status':
       if (b.rssi === undefined) return reject('missing_field');
-      if (typeof b.rssi !== 'number' || !Number.isInteger(b.rssi)) return reject('invalid_field');
+      if (!isInt32(b.rssi)) return reject('invalid_field');
       return { ok: true, event: { ...envelope, type, rssi: b.rssi } };
   }
 }
