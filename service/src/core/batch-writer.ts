@@ -13,7 +13,11 @@ export interface InsertedRow {
 export interface BatchResult {
   /** Rows actually inserted (absent = duplicate). */
   inserted: InsertedRow[];
-  /** Alarms created in the same transaction, sorted by id. */
+  /**
+   * Alarms created in the same transaction, sorted by id. For tests and
+   * diagnostics only: SSE delivery reads new alarms from Postgres via the
+   * AlarmListener (after NOTIFY), so every worker gets them, not just this one.
+   */
   alarms: Alarm[];
 }
 

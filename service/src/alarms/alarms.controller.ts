@@ -19,7 +19,7 @@ export class AlarmsController {
   private readonly logger = new Logger('Alarms');
   private readonly keepaliveMs = loadConfig().sseKeepaliveMs;
 
-  constructor(private readonly alarms: AlarmsService) {}
+  constructor(private readonly alarmsService: AlarmsService) {}
 
   /** Deduplicated falls with ts >= since, sorted by ts. */
   @Get()
@@ -31,7 +31,7 @@ export class AlarmsController {
       );
     }
     return {
-      alarms: (await this.alarms.listSince(sinceMs)).map(toAlarmJson),
+      alarms: (await this.alarmsService.listSince(sinceMs)).map(toAlarmJson),
     };
   }
 
@@ -48,9 +48,9 @@ export class AlarmsController {
     const lastEventId = parseLastEventId(header ?? query);
     return new Observable<MessageEvent>((subscriber) => {
       const close = openSubscription({
-        hub: this.alarms.hub,
+        hub: this.alarmsService.hub,
         lastEventId,
-        loadAfter: (afterId) => this.alarms.loadAfter(afterId),
+        loadAfter: (afterId) => this.alarmsService.loadAfter(afterId),
         send: (alarm) =>
           subscriber.next({ id: String(alarm.id), data: toAlarmJson(alarm) }),
         onError: (err) => {
