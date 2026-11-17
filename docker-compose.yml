@@ -20,6 +20,7 @@ services:
     environment:
       DATABASE_URL: postgres://teton:teton@postgres:5432/teton
       PORT: "8080"
+      WORKERS: ${WORKERS:-} # e.g. WORKERS=1 make run; empty = min(cores, 4)
     ports: ["8080:8080"]
     depends_on:
       postgres:
